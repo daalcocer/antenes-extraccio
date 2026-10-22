@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Entornos virtuales
+.venv/
+venv/
+
+# Temporales
+*.tmp
+*.part
+
+# Salidas antiguas de antenasmoviles
+salida_antenas/
+salida_markers/
+salida_radiaciones/
+
+# Salidas del nuevo extractor
+salida_imagenes_infoantenas_test/
+salida_imagenes_infoantenas/
+imagenes/
+
+# Datos finales generados de Infoantenas
+infoantenas/01_DADES_FINALS/
+
+# Datos de control generados
+infoantenas/02_CONTROL_QUALITAT/
+
+# Datos originales descargados/comprimidos
+infoantenas/04_DADES_ORIGINALS_COMPRIMIDES/
+
+# Datos temporales/reprocesables de Infoantenas
+infoantenas/03_CODI_I_REEXECUCIO/data_raw/
+infoantenas/03_CODI_I_REEXECUCIO/data_output/
+infoantenas/03_CODI_I_REEXECUCIO/logs/
+
+# IDE / sistema
+.vscode/
+.DS_Store
+Thumbs.db
+
+infoantenas/03_CODI_I_REEXECUCIO/config/gis_ids_infoantenas.csv

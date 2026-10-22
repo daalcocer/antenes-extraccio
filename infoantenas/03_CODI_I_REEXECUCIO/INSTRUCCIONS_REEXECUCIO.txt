@@ -1,0 +1,41 @@
+﻿REEXECUCIÓ DE L'EXTRACCIÓ D'INFOANTENAS
+
+1. Requisits
+   - Python 3.10 o posterior.
+   - Instal·lar les dependències:
+     python -m pip install -r requirements.txt
+
+2. Dades originals ja incloses
+   Per tornar a validar l'instantània lliurada sense fer peticions web,
+   descomprimiu els dos ZIP de 04_DADES_ORIGINALS_COMPRIMIDES dins d'aquesta
+   carpeta, de manera que quedin aquestes rutes:
+   data_raw\extraccio_final\geojson_caselles
+   data_raw\extraccio_final\html_detalls
+
+3. Generar de nou la quadrícula territorial, si cal
+   python .\scripts\generar_bbox_infoantenas.py .\data_raw\limits_admin\divisions-administratives-v2r2-catalunya-5000-20260120.json
+
+4. Descarregar les respostes GeoJSON
+   python .\scripts\extreure_infoantenas_bbox.py .\config\bbox_catalunya_infoantenas.csv --peticions-per-minut 10
+
+   El programa és reanudable. El màxim admès pel codi és 18 peticions/minut;
+   10 és el valor prudent documentat.
+
+5. Preparar i validar l'inventari
+   python .\scripts\preparar_inventari_infoantenas.py .\config\bbox_catalunya_infoantenas.csv .\data_raw\extraccio_final\geojson_caselles .\data_raw\limits_admin\divisions-administratives-v2r2-catalunya-5000-20260120.json
+
+6. Descarregar els detalls de cada Gis_ID
+   python .\scripts\descarregar_detalls_infoantenas.py .\config\gis_ids_infoantenas.csv --peticions-per-minut 10
+
+   El programa també és reanudable. El màxim admès pel codi és 20
+   peticions/minut.
+
+7. Extreure i validar les taules de detall
+   python .\scripts\extreure_detalls_infoantenas.py .\config\gis_ids_infoantenas.csv .\data_raw\extraccio_final\html_detalls --registre-descarrega ..\02_CONTROL_QUALITAT\logs\detalls_20260909_131917.csv --maxim-html-faltants 7
+
+IMPORTANT
+- Una reexecució web posterior pot produir resultats diferents perquè la font
+  oficial pot canviar.
+- No s'han de combinar automàticament aquests resultats amb Antenas Móviles:
+  són fonts i estructures diferents.
+- Els límits de peticions són els implementats als scripts lliurats.

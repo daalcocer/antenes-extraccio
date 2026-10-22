@@ -1,0 +1,30 @@
+{
+  "moment_generacio": "2026-09-04T10:08:24",
+  "font_limit": "data_raw\\limits_admin\\divisions-administratives-v2r2-catalunya-5000-20260120.json",
+  "sha256_limit": "9e4138eab17825aeada985d905518c77e3cda113616c294677873d9bb94eb108",
+  "territori": "Catalunya",
+  "limit_reparat_en_memoria": true,
+  "motiu_reparacio": "Ring Self-intersection[3.32264 42.32231]",
+  "bounds_limit": [
+    0.15908,
+    40.52294,
+    3.33249,
+    42.86145
+  ],
+  "amplada_cella_graus": 0.027379989624000123,
+  "alcada_cella_graus": 0.04849433898999678,
+  "solapament_percent": 10.0,
+  "pas_longitud_graus": 0.02464199066160011,
+  "pas_latitud_graus": 0.0436449050909971,
+  "files_grid_rectangle": 54,
+  "columnes_grid_rectangle": 129,
+  "celles_candidates_rectangle": 6966,
+  "bbox_seleccionades": 3515,
+  "cobertura_completa_validada": true,
+  "area_no_coberta_graus_quadrats": 0.0,
+  "durada_minima_hores_a_10_pet_min": 5.858333333333333,
+  "fitxer_csv": "C:\\Users\\FerranBlanchartReyes\\Desktop\\tfg\\extracció dades\\infoantenas\\config\\bbox_catalunya_infoantenas.csv",
+  "sha256_csv": "a71381097f7870d6f39210aaec8987eef3e9b66c99c55fe511bdcdffbfbb969a",
+  "fitxer_geojson": "C:\\Users\\FerranBlanchartReyes\\Desktop\\tfg\\extracció dades\\infoantenas\\config\\bbox_catalunya_infoantenas.geojson",
+  "sha256_geojson": "a3e1c0ede413c513581a1dac5def75aefa4a899949e64cd6879a56409853495a"
+}
