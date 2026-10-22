@@ -1,9 +1,13 @@
 # -*- coding: utf-8 -*-
 
+import contextlib
 import csv
+import email.message
+import io
 import json
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 
 import extraer_imagenes_infoantenas as m
@@ -308,6 +312,559 @@ class TestSalida(unittest.TestCase):
                 "https://antenasmoviles.es/archive/antenas/1729885461_6fbc2e6031932d57e56c.jpg",
             )
             self.assertEqual(imagenes[0]["OPERADOR_COINCIDE"], "SI")
+
+
+# ---------------------------------------------------------------------------
+# Fase 2: modo online (sin red real; el cliente HTTP está simulado)
+# ---------------------------------------------------------------------------
+
+def cabeceras(**valores):
+    mensaje = email.message.Message()
+    for nombre, valor in valores.items():
+        mensaje[nombre.replace("_", "-")] = valor
+    return mensaje
+
+
+class RespuestaFalsa:
+    def __init__(self, cuerpo, status=200, content_type="application/json; charset=utf-8"):
+        self._cuerpo = cuerpo
+        self.status = status
+        self.headers = cabeceras(Content_Type=content_type)
+
+    def read(self):
+        return self._cuerpo
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+def json_bytes(datos):
+    return json.dumps(datos, ensure_ascii=False).encode("utf-8")
+
+
+def http_error(codigo, cuerpo=b"", **cabecera):
+    return urllib.error.HTTPError(
+        "https://x", codigo, f"Error {codigo}", cabeceras(**cabecera), io.BytesIO(cuerpo)
+    )
+
+
+class Abridor:
+    """Sustituye a urlopen: devuelve/lanza los elementos de la secuencia en orden."""
+
+    def __init__(self, *secuencia, por_defecto=None):
+        self.secuencia = list(secuencia)
+        self.por_defecto = por_defecto
+        self.peticiones = []
+
+    def __call__(self, peticion, timeout):
+        self.peticiones.append(peticion)
+        elemento = self.secuencia.pop(0) if self.secuencia else self.por_defecto
+
+        if isinstance(elemento, BaseException):
+            raise elemento
+        if elemento is None:
+            raise AssertionError("Petición inesperada: " + peticion.full_url)
+        return elemento
+
+
+def marker_ok(codigo="1"):
+    return RespuestaFalsa(json_bytes(marker(codigo, "OP", 41.0, 2.0, [imagen("1", "a.jpg")])))
+
+
+def consultar(abridor, gis_id="1", reintentos=3, intervalo=0.0):
+    pausas = []
+    resultado = m.consultar_marker(
+        gis_id,
+        abridor,
+        m.Limitador(intervalo),
+        timeout=5,
+        reintentos=reintentos,
+        dormir=pausas.append,
+        imprimir=lambda *_: None,
+    )
+    return resultado, pausas
+
+
+class TestNombresYUrl(unittest.TestCase):
+    def test_nombre_seguro_conserva_ceros(self):
+        nombre = m.nombre_fichero_marker("0000758")
+        self.assertRegex(nombre, r"^0000758_[0-9a-f]{12}\.json$")
+        self.assertEqual(nombre, m.nombre_fichero_marker("0000758"))
+        self.assertNotEqual(nombre, m.nombre_fichero_marker("000758"))
+
+    def test_nombre_seguro_no_ascii(self):
+        nombre = m.nombre_fichero_marker("CATB0020Ñ")
+        self.assertRegex(nombre, r"^CATB0020%C3%91_[0-9a-f]{12}\.json$")
+        self.assertTrue(nombre.isascii())
+
+    def test_nombre_distingue_mayusculas(self):
+        self.assertNotEqual(
+            m.nombre_fichero_marker("abc").lower(), m.nombre_fichero_marker("ABC").lower()
+        )
+
+    def test_url_literal_y_codificada(self):
+        self.assertEqual(m.construir_url_marker("0000758"), m.MARKERS_URL + "?id=0000758")
+        self.assertEqual(
+            m.construir_url_marker("CATB0020Ñ"), m.MARKERS_URL + "?id=CATB0020%C3%91"
+        )
+
+    def test_peticion_lleva_url_y_cabeceras(self):
+        abridor = Abridor(marker_ok("CATB0020Ñ"))
+        consultar(abridor, "CATB0020Ñ")
+
+        peticion = abridor.peticiones[0]
+        self.assertTrue(peticion.full_url.endswith("?id=CATB0020%C3%91"))
+        self.assertEqual(peticion.get_header("Accept"), "application/json")
+        self.assertTrue(peticion.get_header("User-agent"))
+
+
+class TestClienteMarkers(unittest.TestCase):
+    def test_429_con_retry_after(self):
+        abridor = Abridor(http_error(429, Retry_After="7"), marker_ok())
+        resultado, pausas = consultar(abridor)
+
+        self.assertEqual(resultado["estado"], m.EST_CON_MARKER)
+        self.assertEqual(resultado["intentos"], 2)
+        self.assertEqual(pausas, [7.0])
+
+    def test_429_sin_retry_after_usa_espera_por_defecto(self):
+        abridor = Abridor(http_error(429), marker_ok())
+        resultado, pausas = consultar(abridor)
+
+        self.assertEqual(resultado["estado"], m.EST_CON_MARKER)
+        self.assertEqual(pausas, [m.ESPERA_429_POR_DEFECTO_S])
+
+    def test_5xx_se_reintenta(self):
+        abridor = Abridor(http_error(503), http_error(502), marker_ok())
+        resultado, pausas = consultar(abridor)
+
+        self.assertEqual(resultado["estado"], m.EST_CON_MARKER)
+        self.assertEqual(resultado["intentos"], 3)
+        self.assertEqual(pausas, [10, 20])
+
+    def test_5xx_agotado(self):
+        abridor = Abridor(por_defecto=http_error(500))
+        resultado, pausas = consultar(abridor, reintentos=2)
+
+        self.assertEqual(resultado["estado"], m.EST_ERROR_HTTP_RECUPERABLE)
+        self.assertEqual(resultado["http_status"], 500)
+        self.assertEqual(resultado["intentos"], 3)
+        self.assertEqual(len(pausas), 2)
+
+    def test_error_de_red_recuperable(self):
+        abridor = Abridor(urllib.error.URLError("sin conexion"), TimeoutError("lento"), marker_ok())
+        resultado, _ = consultar(abridor)
+
+        self.assertEqual(resultado["estado"], m.EST_CON_MARKER)
+        self.assertEqual(resultado["intentos"], 3)
+
+    def test_error_de_red_agotado(self):
+        abridor = Abridor(por_defecto=urllib.error.URLError("sin conexion"))
+        resultado, _ = consultar(abridor, reintentos=1)
+
+        self.assertEqual(resultado["estado"], m.EST_ERROR_RED)
+        self.assertEqual(resultado["intentos"], 2)
+        self.assertIn("sin conexion", resultado["error"])
+
+    def test_http_no_recuperable_no_se_reintenta(self):
+        abridor = Abridor(http_error(403, b"<html>prohibido</html>"))
+        resultado, pausas = consultar(abridor)
+
+        self.assertEqual(resultado["estado"], m.EST_HTTP_NO_RECUPERABLE)
+        self.assertEqual(resultado["http_status"], 403)
+        self.assertEqual(resultado["intentos"], 1)
+        self.assertEqual(pausas, [])
+        self.assertIn("prohibido", resultado["muestra"])
+
+    def test_http_404_se_distingue(self):
+        resultado, _ = consultar(Abridor(http_error(404)))
+
+        self.assertEqual(resultado["estado"], m.EST_HTTP_NO_ENCONTRADO)
+        self.assertEqual(resultado["http_status"], 404)
+        self.assertEqual(resultado["intentos"], 1)
+
+    def test_json_vacio(self):
+        resultado, _ = consultar(Abridor(RespuestaFalsa(b"[]")))
+
+        self.assertEqual(resultado["estado"], m.EST_JSON_VACIO)
+        self.assertEqual(resultado["data"], [])
+
+    def test_estructura_inesperada(self):
+        resultado, _ = consultar(Abridor(RespuestaFalsa(b'{"error": "x"}')))
+
+        self.assertEqual(resultado["estado"], m.EST_ESTRUCTURA_INESPERADA)
+        self.assertIsNone(resultado["data"])
+
+    def test_lista_sin_marker_compatible(self):
+        resultado, _ = consultar(Abridor(RespuestaFalsa(b"[1, 2]")))
+        self.assertEqual(resultado["estado"], m.EST_SIN_MARKER_COMPATIBLE)
+
+    def test_json_invalido_y_cuerpo_vacio(self):
+        for cuerpo in (b"<html>Cloudflare</html>", b"", b"   "):
+            resultado, _ = consultar(Abridor(RespuestaFalsa(cuerpo)))
+            self.assertEqual(resultado["estado"], m.EST_JSON_INVALIDO)
+
+    def test_registra_cabeceras_y_content_type(self):
+        respuesta = RespuestaFalsa(b"[]")
+        respuesta.headers["ETag"] = '"abc"'
+        respuesta.headers["Set-Cookie"] = "ci_session=secreto"
+        respuesta.headers["X-RateLimit-Remaining"] = "5"
+        respuesta.headers["Report-To"] = "ruido"
+        resultado, _ = consultar(Abridor(respuesta))
+
+        self.assertEqual(resultado["content_type"], "application/json; charset=utf-8")
+        self.assertEqual(resultado["cabeceras"]["etag"], '"abc"')
+        self.assertEqual(resultado["cabeceras"]["x-ratelimit-remaining"], "5")
+        self.assertNotIn("set-cookie", resultado["cabeceras"])
+        self.assertNotIn("report-to", resultado["cabeceras"])
+        self.assertEqual(resultado["bytes"], 2)
+
+    def test_limitador_respeta_intervalo(self):
+        ahora = [0.0]
+        pausas = []
+
+        def dormir(segundos):
+            pausas.append(segundos)
+            ahora[0] += segundos
+
+        limitador = m.Limitador(6.0, reloj=lambda: ahora[0], dormir=dormir)
+        limitador.esperar()
+        limitador.marcar()
+        ahora[0] += 2.0
+        limitador.esperar()
+
+        self.assertEqual(pausas, [4.0])
+
+
+class TestRespuestasGuardadas(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+
+    def guardar(self, gis_id="1", data=None):
+        ruta = self.dir / m.nombre_fichero_marker(gis_id)
+        resultado = {
+            "http_status": 200, "url": m.construir_url_marker(gis_id),
+            "content_type": "application/json", "data": [] if data is None else data,
+        }
+        m.guardar_respuesta(ruta, gis_id, resultado)
+        return ruta
+
+    def test_guardar_y_leer(self):
+        ruta = self.guardar("CATB0020Ñ", MARKER_REAL)
+        registro = m.leer_respuesta_guardada(ruta, "CATB0020Ñ")
+
+        self.assertEqual(registro["GIS_ID"], "CATB0020Ñ")
+        self.assertEqual(registro["HTTP_STATUS"], 200)
+        self.assertEqual(registro["RESPUESTA"], MARKER_REAL)
+        self.assertFalse(list(self.dir.glob("*.part")))
+
+    def test_invalidos(self):
+        ruta = self.guardar("1")
+        casos = {
+            "vacio": "",
+            "json_invalido": "{no es json",
+            "no_objeto": "[]",
+            "otro_gis_id": json.dumps({"GIS_ID": "2", "HTTP_STATUS": 200, "RESPUESTA": []}),
+            "status_404": json.dumps({"GIS_ID": "1", "HTTP_STATUS": 404, "RESPUESTA": []}),
+            "respuesta_no_lista": json.dumps({"GIS_ID": "1", "HTTP_STATUS": 200, "RESPUESTA": {}}),
+        }
+
+        for nombre, contenido in casos.items():
+            with self.subTest(nombre):
+                ruta.write_text(contenido, encoding="utf-8")
+                self.assertIsNone(m.leer_respuesta_guardada(ruta, "1"))
+
+        self.assertIsNone(m.leer_respuesta_guardada(self.dir / "no_existe.json", "1"))
+
+
+class TestReanudacion(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        self.markers = self.tmp / "markers"
+        self.markers.mkdir()
+        self.log = self.tmp / "log_markers.csv"
+
+    def pendientes(self, ids, abridor, **kwargs):
+        return m.consultar_pendientes(
+            ids, self.markers, self.log, abridor, m.Limitador(0.0),
+            timeout=5, reintentos=0, dormir=lambda s: None,
+            imprimir=lambda *_: None, **kwargs,
+        )
+
+    def leer_log(self):
+        with self.log.open(encoding="utf-8-sig", newline="") as f:
+            return list(csv.DictReader(f, delimiter=";"))
+
+    def test_fichero_valido_se_reutiliza(self):
+        self.pendientes(["1", "0002"], Abridor(marker_ok("1"), marker_ok("0002")))
+
+        abridor = Abridor()
+        resultado = self.pendientes(["1", "0002"], abridor)
+
+        self.assertEqual(abridor.peticiones, [])
+        self.assertEqual(resultado["contadores"], {m.EST_YA_EXISTENTE: 2})
+        self.assertEqual([r["ESTADO"] for r in self.leer_log()], [m.EST_YA_EXISTENTE] * 2)
+
+    def test_pendientes_invalidos_se_reconsultan(self):
+        self.pendientes(["vacio", "corrupto", "ajeno", "bueno"],
+                        Abridor(*[marker_ok() for _ in range(4)]))
+
+        (self.markers / m.nombre_fichero_marker("vacio")).write_text("", encoding="utf-8")
+        (self.markers / m.nombre_fichero_marker("corrupto")).write_text("{x", encoding="utf-8")
+        (self.markers / m.nombre_fichero_marker("ajeno")).write_text(
+            json.dumps({"GIS_ID": "otro", "HTTP_STATUS": 200, "RESPUESTA": []}), encoding="utf-8")
+
+        abridor = Abridor(marker_ok(), marker_ok(), marker_ok())
+        resultado = self.pendientes(["vacio", "corrupto", "ajeno", "bueno"], abridor)
+
+        self.assertEqual(len(abridor.peticiones), 3)
+        self.assertEqual(resultado["estados"]["bueno"], m.EST_YA_EXISTENTE)
+        for gis_id in ("vacio", "corrupto", "ajeno"):
+            self.assertEqual(resultado["estados"][gis_id], m.EST_CON_MARKER)
+            self.assertIsNotNone(
+                m.leer_respuesta_guardada(self.markers / m.nombre_fichero_marker(gis_id), gis_id)
+            )
+
+    def test_interrupcion_y_reanudacion(self):
+        abridor = Abridor(marker_ok("1"), KeyboardInterrupt())
+
+        with self.assertRaises(KeyboardInterrupt):
+            self.pendientes(["1", "2", "3"], abridor)
+
+        self.assertEqual([r["GIS_ID"] for r in self.leer_log()], ["1"])
+
+        abridor = Abridor(marker_ok("2"), marker_ok("3"))
+        resultado = self.pendientes(["1", "2", "3"], abridor)
+
+        self.assertEqual(len(abridor.peticiones), 2)
+        self.assertTrue(abridor.peticiones[0].full_url.endswith("id=2"))
+        self.assertEqual(resultado["estados"]["1"], m.EST_YA_EXISTENTE)
+        self.assertEqual([r["GIS_ID"] for r in self.leer_log()], ["1", "2", "3"])
+
+    def test_un_gis_id_con_error_no_aborta(self):
+        resultado = self.pendientes(
+            ["a", "b", "c"], Abridor(http_error(403), http_error(404), marker_ok("c"))
+        )
+
+        self.assertEqual(
+            list(resultado["estados"].values()),
+            [m.EST_HTTP_NO_RECUPERABLE, m.EST_HTTP_NO_ENCONTRADO, m.EST_CON_MARKER],
+        )
+        self.assertFalse((self.markers / m.nombre_fichero_marker("a")).exists())
+        self.assertFalse((self.markers / m.nombre_fichero_marker("b")).exists())
+
+    def test_errores_no_persistidos_y_log_con_campos(self):
+        self.pendientes(["a"], Abridor(http_error(403, b"prohibido")))
+        fila = self.leer_log()[0]
+
+        self.assertEqual(fila["ESTADO"], m.EST_HTTP_NO_RECUPERABLE)
+        self.assertEqual(fila["HTTP_STATUS"], "403")
+        self.assertEqual(fila["INTENTOS"], "1")
+        self.assertEqual(fila["BYTES"], "9")
+        self.assertIn("403", fila["ERROR"])
+        self.assertEqual(fila["MUESTRA_CUERPO"], "prohibido")
+
+    def test_log_es_nuevo_en_cada_invocacion(self):
+        self.pendientes(["a"], Abridor(http_error(403)))
+        self.pendientes(["a"], Abridor(marker_ok("a")))
+
+        filas = self.leer_log()
+        self.assertEqual(len(filas), 1)
+        self.assertEqual(filas[0]["ESTADO"], m.EST_CON_MARKER)
+
+    def test_parada_por_errores_consecutivos_configurable(self):
+        abridor = Abridor(por_defecto=http_error(403))
+        resultado = self.pendientes(["a", "b", "c", "d"], abridor, max_errores_consecutivos=2)
+
+        self.assertTrue(resultado["detenido"])
+        self.assertEqual(len(abridor.peticiones), 2)
+
+        resultado = self.pendientes(["a", "b", "c"], Abridor(por_defecto=http_error(403)))
+        self.assertFalse(resultado["detenido"])
+        self.assertEqual(len(resultado["estados"]), 3)
+
+    def test_no_encontrado_no_cuenta_como_error_consecutivo(self):
+        abridor = Abridor(por_defecto=http_error(404))
+        resultado = self.pendientes(["a", "b", "c"], abridor, max_errores_consecutivos=1)
+
+        self.assertFalse(resultado["detenido"])
+
+
+class TestRunJson(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.trabajo = Path(self._tmp.name) / "trabajo"
+        self.addCleanup(self._tmp.cleanup)
+        self.params = {"timeout": 5, "reintentos": 0}
+
+    def preparar(self, sha="aaa", resume=False):
+        return m.preparar_trabajo(self.trabajo, Path("inv.csv"), sha, self.params, resume)
+
+    def test_nueva_ejecucion_escribe_run_y_limpia_estado_previo(self):
+        self.preparar("aaa")
+        (self.trabajo / "markers" / "viejo.json").write_text("{}", encoding="utf-8")
+        (self.trabajo / "log_markers.csv").write_text("x", encoding="utf-8")
+
+        run = self.preparar("bbb")
+
+        self.assertEqual(run["inventario_sha256"], "bbb")
+        self.assertEqual(run["formato"], m.FORMATO_RUN)
+        self.assertEqual(run["parametros"], self.params)
+        self.assertFalse((self.trabajo / "markers" / "viejo.json").exists())
+        self.assertFalse((self.trabajo / "log_markers.csv").exists())
+        guardado = json.loads((self.trabajo / "run.json").read_text(encoding="utf-8"))
+        self.assertEqual(guardado["inventario_sha256"], "bbb")
+
+    def test_resume_con_mismo_sha(self):
+        inicial = self.preparar("aaa")
+        (self.trabajo / "markers" / "respuesta.json").write_text("{}", encoding="utf-8")
+
+        run = self.preparar("aaa", resume=True)
+
+        self.assertEqual(run["inicio"], inicial["inicio"])
+        self.assertEqual(len(run["reanudaciones"]), 1)
+        self.assertTrue((self.trabajo / "markers" / "respuesta.json").exists())
+
+    def test_resume_con_sha_distinto_se_rechaza(self):
+        self.preparar("aaa")
+
+        with self.assertRaises(ValueError) as ctx:
+            self.preparar("bbb", resume=True)
+
+        self.assertIn("SHA-256", str(ctx.exception))
+        self.assertIn("sin --resume", str(ctx.exception))
+
+    def test_resume_sin_run_previo(self):
+        with self.assertRaises(ValueError):
+            self.preparar("aaa", resume=True)
+
+    def test_resume_con_run_ilegible(self):
+        self.preparar("aaa")
+        (self.trabajo / "run.json").write_text("{roto", encoding="utf-8")
+
+        with self.assertRaises(ValueError):
+            self.preparar("aaa", resume=True)
+
+
+class TestOnlineIntegracion(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        self.inv = self.tmp / "inv.csv"
+        escribir_inventario(self.inv, [
+            ("0000758", "VODAFONE ESPAÑA, S.A.U.", 41.321464, 2.014425),
+            ("CATB0020Ñ", "ORANGE ESPAGNE, S.A.U.", 41.392092, 2.124386),
+            ("999", "ORANGE ESPAGNE, S.A.U.", 41.0, 2.0),
+        ])
+        self.params = {"timeout": 5, "reintentos": 0}
+
+    def online(self, abridor, **kwargs):
+        return m.ejecutar_online(
+            self.inv, self.tmp / "out", self.tmp / "out" / "_treball",
+            abrir=abridor, limitador=m.Limitador(0.0), parametros=self.params,
+            dormir=lambda s: None, imprimir=lambda *_: None, **kwargs,
+        )
+
+    def test_online_y_offline_generan_lo_mismo(self):
+        datos = {
+            "0000758": MARKER_REAL,
+            "CATB0020Ñ": marker("CATB0020Ñ", "ORANGE ESPAGNE, S.A.U.", 41.392092, 2.124386,
+                                [imagen("5", "b.jpg")]),
+        }
+        abridor = Abridor(
+            RespuestaFalsa(json_bytes(datos["0000758"])),
+            RespuestaFalsa(json_bytes(datos["CATB0020Ñ"])),
+            http_error(404),
+        )
+        resumen, consulta = self.online(abridor)
+
+        raw = self.tmp / "raw.jsonl"
+        raw.write_text("".join(
+            json.dumps({"codigo_antena": c, "http_status": 200, "data": d}, ensure_ascii=False) + "\n"
+            for c, d in datos.items()
+        ), encoding="utf-8")
+        m.ejecutar(self.inv, raw, self.tmp / "off")
+
+        for nombre in ("CONTROL_GIS_ID.csv", "IMATGES_INFOANTENAS.csv"):
+            online = (self.tmp / "out" / nombre).read_text(encoding="utf-8-sig").splitlines()
+            offline = (self.tmp / "off" / nombre).read_text(encoding="utf-8-sig").splitlines()
+            if nombre == "IMATGES_INFOANTENAS.csv":
+                self.assertEqual(online, offline)
+            else:
+                # Solo difiere la explicación del no encontrado.
+                self.assertEqual(online[:-1], offline[:-1])
+                self.assertIn("CONSULTA_HTTP_NO_ENCONTRADO", online[-1])
+
+        self.assertEqual(resumen["modo"], "online")
+        self.assertEqual(resumen["cruce"]["gis_id_encontrados"], 2)
+        self.assertEqual(resumen["consulta"]["estados"],
+                         {m.EST_CON_MARKER: 2, m.EST_HTTP_NO_ENCONTRADO: 1})
+        self.assertTrue((self.tmp / "out" / "resum_online.json").is_file())
+        self.assertFalse((self.tmp / "out" / "resum_offline.json").exists())
+
+    def test_seleccion_por_gis_id_y_maxim(self):
+        abridor = Abridor(marker_ok("999"))
+        resumen, _ = self.online(abridor, gis_ids=["999", "0000758"], maxim=1)
+
+        self.assertEqual(resumen["seleccion"]["gis_id_seleccionados"], 1)
+        self.assertEqual(len(abridor.peticiones), 1)
+        self.assertTrue(abridor.peticiones[0].full_url.endswith("id=999"))
+
+        with self.assertRaises(ValueError):
+            self.online(Abridor(), gis_ids=["no_existe"])
+
+    def test_resume_completa_solo_los_pendientes(self):
+        with self.assertRaises(KeyboardInterrupt):
+            self.online(Abridor(marker_ok("0000758"), KeyboardInterrupt()))
+
+        abridor = Abridor(marker_ok("CATB0020Ñ"), marker_ok("999"))
+        resumen, consulta = self.online(abridor, resume=True)
+
+        self.assertEqual(len(abridor.peticiones), 2)
+        self.assertEqual(consulta["contadores"][m.EST_YA_EXISTENTE], 1)
+        self.assertTrue(resumen["consulta"]["reanudacion"])
+
+    def test_nueva_ejecucion_vuelve_a_consultar_todo(self):
+        self.online(Abridor(marker_ok("0000758"), marker_ok("CATB0020Ñ"), marker_ok("999")))
+
+        abridor = Abridor(marker_ok("0000758"), marker_ok("CATB0020Ñ"), marker_ok("999"))
+        self.online(abridor)
+
+        self.assertEqual(len(abridor.peticiones), 3)
+
+    def test_sha_distinto_impide_resume(self):
+        self.online(Abridor(marker_ok("0000758"), marker_ok("CATB0020Ñ"), marker_ok("999")))
+        escribir_inventario(self.inv, [("0000758", "VODAFONE ESPAÑA, S.A.U.", 41.3, 2.0)])
+
+        with self.assertRaises(ValueError) as ctx:
+            self.online(Abridor(), resume=True)
+
+        self.assertIn("SHA-256", str(ctx.exception))
+
+    def test_parada_por_errores_no_genera_salidas(self):
+        resumen, consulta = self.online(
+            Abridor(por_defecto=http_error(403)), max_errores_consecutivos=2
+        )
+
+        self.assertIsNone(resumen)
+        self.assertTrue(consulta["detenido"])
+        self.assertFalse((self.tmp / "out" / "CONTROL_GIS_ID.csv").exists())
+
+
+class TestCli(unittest.TestCase):
+    def test_opciones_online_requieren_modo_online(self):
+        for opcion in (["--resume"], ["--maxim", "3"], ["--gis-id", "1"]):
+            with self.subTest(opcion), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    m.main(opcion)
 
 
 if __name__ == "__main__":
