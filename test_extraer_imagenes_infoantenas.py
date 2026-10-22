@@ -9,6 +9,7 @@ import tempfile
 import unittest
 import urllib.error
 from pathlib import Path
+from unittest import mock
 
 from PIL import Image
 
@@ -1480,6 +1481,712 @@ class TestOnlineConImagenes(unittest.TestCase):
         estados = {f["NOMBRE_FICHERO_ORIGEN"]: f["ESTADO_DESCARGA"] for f in self.leer_csv()}
         self.assertEqual(estados["compartida.jpg"], m.EST_IMG_OK)
         self.assertEqual(estados["propia.png"], m.EST_IMG_HTTP_ERROR)
+
+
+# ---------------------------------------------------------------------------
+# Fase 4: versionado nueva / actual / anterior (sin red)
+# ---------------------------------------------------------------------------
+
+def arbol(ruta):
+    """Contenido completo de un directorio: ruta relativa -> bytes."""
+    ruta = Path(ruta)
+    return {
+        str(p.relative_to(ruta)): p.read_bytes()
+        for p in sorted(ruta.rglob("*")) if p.is_file()
+    }
+
+
+def crear_version(ruta, contenido="datos", completa=True):
+    ruta = Path(ruta)
+    ruta.mkdir(parents=True)
+    (ruta / "datos.txt").write_text(contenido, encoding="utf-8")
+    if completa:
+        (ruta / m.MARCADOR_COMPLETA).write_text("{}", encoding="utf-8")
+    return ruta
+
+
+class TestPromocion(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.raiz = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        self.nueva, self.actual, self.anterior = m.rutas_versiones(self.raiz)
+
+    def texto(self, ruta):
+        return (ruta / "datos.txt").read_text(encoding="utf-8")
+
+    def test_promocion_sin_version_previa(self):
+        crear_version(self.nueva, "N")
+
+        m.promover_nueva(self.raiz)
+
+        self.assertFalse(self.nueva.exists())
+        self.assertFalse(self.anterior.exists())
+        self.assertEqual(self.texto(self.actual), "N")
+
+    def test_promocion_con_version_previa(self):
+        crear_version(self.actual, "A")
+        crear_version(self.anterior, "B_antiguo")
+        crear_version(self.nueva, "N")
+
+        m.promover_nueva(self.raiz)
+
+        self.assertEqual(self.texto(self.actual), "N")
+        self.assertEqual(self.texto(self.anterior), "A")
+        self.assertFalse(self.nueva.exists())
+        self.assertNotIn("B_antiguo", [p.read_text(encoding="utf-8") for p in self.raiz.rglob("datos.txt")])
+
+    def test_promocion_con_actual_y_sin_anterior(self):
+        crear_version(self.actual, "A")
+        crear_version(self.nueva, "N")
+
+        m.promover_nueva(self.raiz)
+
+        self.assertEqual(self.texto(self.anterior), "A")
+        self.assertEqual(self.texto(self.actual), "N")
+
+    def test_nueva_sin_completa_no_se_promociona(self):
+        crear_version(self.actual, "A")
+        crear_version(self.nueva, "N", completa=False)
+        antes = arbol(self.raiz)
+
+        with self.assertRaises(ValueError):
+            m.promover_nueva(self.raiz)
+
+        self.assertEqual(arbol(self.raiz), antes)
+
+    def test_actual_sin_completa_no_se_sustituye(self):
+        crear_version(self.actual, "A", completa=False)
+        crear_version(self.nueva, "N")
+        antes = arbol(self.raiz)
+
+        with self.assertRaises(m.EstadoVersionesAmbiguo):
+            m.promover_nueva(self.raiz)
+
+        self.assertEqual(arbol(self.raiz), antes)
+
+
+class TestRecuperacion(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.raiz = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        self.nueva, self.actual, self.anterior = m.rutas_versiones(self.raiz)
+
+    def texto(self, ruta):
+        return (ruta / "datos.txt").read_text(encoding="utf-8")
+
+    def test_caso_a_completa_nueva_si_falta_actual(self):
+        crear_version(self.anterior, "A")
+        crear_version(self.nueva, "N")
+
+        accion = m.recuperar_versiones(self.raiz)
+
+        self.assertIn("nueva -> actual", accion)
+        self.assertEqual(self.texto(self.actual), "N")
+        self.assertEqual(self.texto(self.anterior), "A")
+        self.assertFalse(self.nueva.exists())
+
+    def test_caso_b_restaura_anterior_si_nueva_incompleta(self):
+        crear_version(self.anterior, "A")
+        crear_version(self.nueva, "parcial", completa=False)
+
+        accion = m.recuperar_versiones(self.raiz)
+
+        self.assertIn("anterior -> actual", accion)
+        self.assertEqual(self.texto(self.actual), "A")
+        self.assertFalse(self.anterior.exists())
+        self.assertEqual(self.texto(self.nueva), "parcial")
+
+    def test_caso_b_tambien_si_no_hay_nueva(self):
+        crear_version(self.anterior, "A")
+
+        m.recuperar_versiones(self.raiz)
+
+        self.assertEqual(self.texto(self.actual), "A")
+
+    def test_caso_c_con_actual_no_se_toca_nada(self):
+        crear_version(self.actual, "A")
+        crear_version(self.anterior, "B")
+        crear_version(self.nueva, "N")
+        antes = arbol(self.raiz)
+
+        self.assertIsNone(m.recuperar_versiones(self.raiz))
+        self.assertEqual(arbol(self.raiz), antes)
+
+    def test_sin_nada_que_recuperar(self):
+        self.assertIsNone(m.recuperar_versiones(self.raiz))
+        crear_version(self.nueva, "parcial", completa=False)
+        self.assertIsNone(m.recuperar_versiones(self.raiz))
+
+    def test_ambiguo_actual_sin_completa(self):
+        crear_version(self.actual, "A", completa=False)
+        crear_version(self.nueva, "N")
+        antes = arbol(self.raiz)
+
+        with self.assertRaises(m.EstadoVersionesAmbiguo):
+            m.recuperar_versiones(self.raiz)
+
+        self.assertEqual(arbol(self.raiz), antes)
+
+    def test_ambiguo_anterior_sin_completa_y_sin_actual(self):
+        crear_version(self.anterior, "A", completa=False)
+        crear_version(self.nueva, "parcial", completa=False)
+        antes = arbol(self.raiz)
+
+        with self.assertRaises(m.EstadoVersionesAmbiguo):
+            m.recuperar_versiones(self.raiz)
+
+        self.assertEqual(arbol(self.raiz), antes)
+
+    def test_ambiguo_si_una_ruta_es_un_fichero(self):
+        self.nueva.write_text("no soy un directorio", encoding="utf-8")
+        crear_version(self.anterior, "A")
+
+        with self.assertRaises(m.EstadoVersionesAmbiguo):
+            m.recuperar_versiones(self.raiz)
+
+        self.assertEqual(self.nueva.read_text(encoding="utf-8"), "no soy un directorio")
+        self.assertTrue(self.anterior.exists())
+        self.assertFalse(self.actual.exists())
+
+    def test_corte_entre_actual_a_anterior_y_nueva_a_actual(self):
+        crear_version(self.actual, "A")
+        crear_version(self.nueva, "N")
+        llamadas = []
+
+        def renombrar_con_corte(origen, destino):
+            llamadas.append((origen.name, destino.name))
+            if len(llamadas) == 2:
+                raise OSError("corte simulado")
+            m._renombrar(origen, destino)
+
+        with self.assertRaises(OSError):
+            m.promover_nueva(self.raiz, renombrar_con_corte)
+
+        self.assertEqual(llamadas, [("actual", "anterior"), ("nueva", "actual")])
+        self.assertFalse(self.actual.exists())
+        self.assertEqual(self.texto(self.anterior), "A")
+        self.assertTrue(m.version_completa(self.nueva))
+
+        m.recuperar_versiones(self.raiz)
+
+        self.assertEqual(self.texto(self.actual), "N")
+        self.assertEqual(self.texto(self.anterior), "A")
+        self.assertFalse(self.nueva.exists())
+
+    def test_corte_con_nueva_incompleta_restaura_anterior(self):
+        crear_version(self.anterior, "A")
+        crear_version(self.nueva, "reanudable", completa=False)
+
+        m.recuperar_versiones(self.raiz)
+
+        self.assertEqual(self.texto(self.actual), "A")
+        self.assertEqual(self.texto(self.nueva), "reanudable")
+
+
+class VersionesBase(unittest.TestCase):
+    """Escenario: 3 Gis_ID; uno con marker [] y dos con imágenes (una compartida)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        self.raiz = self.tmp / "versiones"
+        self.nueva, self.actual, self.anterior = m.rutas_versiones(self.raiz)
+        self.inv = self.tmp / "inv.csv"
+        escribir_inventario(self.inv, [
+            ("0000758", "OP", 41.0, 2.0),
+            ("4300034", "OP", 41.0, 2.0),
+            ("999", "OP", 41.0, 2.0),
+        ])
+        self.params = {"timeout": 5, "reintentos": 0, "descargar_imagenes": True,
+                       "miniatura_max": 300}
+        compartida = dict(imagen("173568", "compartida.jpg"), old="1")
+        self.respuestas = {
+            "0000758": marker("0000758", "OP", 41.0, 2.0,
+                              [compartida, imagen("200", "propia.png")]),
+            "4300034": marker("4300034", "OP", 41.0, 2.0, [compartida]),
+            "999": [],
+        }
+
+    def marcadores(self):
+        return Abridor(*[
+            RespuestaFalsa(json_bytes(self.respuestas[g])) for g in ("0000758", "4300034", "999")
+        ])
+
+    def imagenes_ok(self):
+        return Abridor(respuesta_imagen("JPEG"), respuesta_imagen("PNG", (500, 500)))
+
+    def ejecutar(self, markers=None, imagenes=None, resume=False, maxim_imagenes=None,
+                 parar_ante_bloqueo=False, **kwargs):
+        descarga = {
+            "abrir": imagenes if imagenes is not None else self.imagenes_ok(),
+            "limitador": m.Limitador(0.0), "thumb_max": 300, "reintentos": 0,
+            "maxim_imagenes": maxim_imagenes, "parar_ante_bloqueo": parar_ante_bloqueo,
+        }
+        parametros = dict(
+            self.params, gis_ids=kwargs.get("gis_ids"), maxim=kwargs.get("maxim"),
+            maxim_imatges=maxim_imagenes,
+        )
+        return m.ejecutar_version(
+            self.inv, self.raiz,
+            abrir=markers if markers is not None else self.marcadores(),
+            limitador=m.Limitador(0.0), parametros=parametros, descarga=descarga,
+            resume=resume, dormir=lambda s: None, imprimir=lambda *_: None, **kwargs,
+        )
+
+    def leer_csv(self, version, nombre="IMATGES_INFOANTENAS.csv"):
+        with (version / nombre).open(encoding="utf-8-sig", newline="") as f:
+            return list(csv.DictReader(f, delimiter=";"))
+
+    def leer_resumen(self, version):
+        return json.loads((version / "resum.json").read_text(encoding="utf-8"))
+
+
+class TestVersionadoPromocion(VersionesBase):
+    def test_ejecucion_correcta_crea_completa_y_promociona(self):
+        resultado = self.ejecutar()
+
+        self.assertTrue(resultado["promocionable"])
+        self.assertTrue(resultado["promovida"])
+        self.assertEqual(resultado["motivos"], [])
+        self.assertTrue((self.actual / m.MARCADOR_COMPLETA).is_file())
+        self.assertFalse(self.nueva.exists())
+        self.assertFalse(self.anterior.exists())
+        for nombre in m.ARCHIVOS_VERSION:
+            self.assertTrue((self.actual / nombre).is_file(), nombre)
+        self.assertTrue((self.actual / "full" / "compartida.jpg").is_file())
+        self.assertTrue((self.actual / "thumb" / "propia.png").is_file())
+        self.assertEqual(list(self.actual.rglob("*.part")), [])
+        self.assertEqual(m.codigo_salida_version(resultado), 0)
+
+    def test_completa_es_lo_ultimo_que_se_crea(self):
+        original = m.crear_completa
+        visto = {}
+
+        def espia(version_dir, metadatos):
+            visto["antes"] = sorted(p.name for p in version_dir.iterdir())
+            original(version_dir, metadatos)
+
+        with mock.patch.object(m, "crear_completa", side_effect=espia):
+            self.ejecutar()
+
+        self.assertNotIn(m.MARCADOR_COMPLETA, visto["antes"])
+        for nombre in m.ARCHIVOS_VERSION:
+            self.assertIn(nombre, visto["antes"])
+
+        completa = (self.actual / m.MARCADOR_COMPLETA).stat().st_mtime_ns
+        otros = [p.stat().st_mtime_ns for p in self.actual.rglob("*")
+                 if p.is_file() and p.name != m.MARCADOR_COMPLETA]
+        self.assertGreaterEqual(completa, max(otros))
+
+    def test_error_de_imagen_no_crea_completa(self):
+        imagenes = Abridor(respuesta_imagen("JPEG"), http_error(404))
+        resultado = self.ejecutar(imagenes=imagenes)
+
+        self.assertFalse(resultado["promocionable"])
+        self.assertFalse(resultado["promovida"])
+        self.assertIn("ERRORES_IMAGEN:1", resultado["motivos"])
+        self.assertFalse((self.nueva / m.MARCADOR_COMPLETA).exists())
+        self.assertTrue(self.nueva.is_dir())
+        self.assertFalse(self.actual.exists())
+        self.assertEqual(m.codigo_salida_version(resultado), 2)
+        self.assertFalse(self.leer_resumen(self.nueva)["version"]["promocionable"])
+
+    def test_error_de_markers_no_promociona(self):
+        markers = Abridor(RespuestaFalsa(json_bytes(self.respuestas["0000758"])),
+                          http_error(403), RespuestaFalsa(b"[]"))
+        resultado = self.ejecutar(markers=markers)
+
+        self.assertFalse(resultado["promocionable"])
+        self.assertIn("ERRORES_MARKERS:1", resultado["motivos"])
+        self.assertFalse((self.nueva / m.MARCADOR_COMPLETA).exists())
+
+    def test_consulta_detenida_deja_nueva_sin_completa(self):
+        resultado = self.ejecutar(markers=Abridor(por_defecto=http_error(403)),
+                                  max_errores_consecutivos=1)
+
+        self.assertFalse(resultado["promocionable"])
+        self.assertIn("CONSULTA_DETENIDA_POR_ERRORES", resultado["motivos"])
+        self.assertEqual(m.codigo_salida_version(resultado), 3)
+        self.assertFalse((self.nueva / m.MARCADOR_COMPLETA).exists())
+        self.assertFalse(self.leer_resumen(self.nueva)["version"]["promocionable"])
+
+    def test_bloqueo_no_se_promociona(self):
+        imagenes = Abridor(respuesta_imagen("JPEG"), http_error(429))
+        resultado = self.ejecutar(imagenes=imagenes, parar_ante_bloqueo=True)
+
+        self.assertIn("BLOQUEO_DETECTADO", resultado["motivos"])
+        self.assertEqual(m.codigo_salida_version(resultado), 4)
+        self.assertFalse(self.actual.exists())
+
+    def test_pendientes_no_se_promociona(self):
+        resultado = self.ejecutar(maxim_imagenes=1, permitir_parcial=True)
+
+        self.assertFalse(resultado["promocionable"])
+        self.assertIn("IMAGENES_PENDIENTES:1", resultado["motivos"])
+        self.assertFalse(self.actual.exists())
+        self.assertEqual(m.codigo_salida_version(resultado), 5)
+
+    def test_marker_vacio_no_impide_promocion(self):
+        resultado = self.ejecutar()
+        control = {f["GIS_ID"]: f for f in self.leer_csv(self.actual, "CONTROL_GIS_ID.csv")}
+
+        self.assertTrue(resultado["promovida"])
+        self.assertEqual(control["999"]["ENCONTRADO_ANTENASMOVILES"], "NO")
+        self.assertEqual(control["999"]["NUM_IMAGENES"], "0")
+        self.assertEqual(control["999"]["OBSERVACIONES"], "MARKER_SIN_ELEMENTOS")
+
+    def test_old_y_desmantelada_no_impiden_promocion(self):
+        resultado = self.ejecutar()
+        filas = {f["NOMBRE_FICHERO_ORIGEN"]: f for f in self.leer_csv(self.actual)}
+
+        self.assertTrue(resultado["promovida"])
+        self.assertEqual(filas["compartida.jpg"]["OLD"], "1")
+        self.assertEqual(filas["propia.png"]["DESMANTELADA"], "1")
+        self.assertEqual({f["ESTADO_DESCARGA"] for f in filas.values()}, {m.EST_IMG_OK})
+
+    def test_operador_y_distancia_no_impiden_promocion(self):
+        escribir_inventario(self.inv, [
+            ("0000758", "OTRO OPERADOR", 45.0, 5.0),
+            ("4300034", "OTRO OPERADOR", 45.0, 5.0),
+            ("999", "OTRO OPERADOR", 45.0, 5.0),
+        ])
+
+        resultado = self.ejecutar()
+        control = {f["GIS_ID"]: f for f in self.leer_csv(self.actual, "CONTROL_GIS_ID.csv")}
+
+        self.assertTrue(resultado["promovida"])
+        self.assertEqual(control["0000758"]["OPERADOR_COINCIDE"], "NO")
+        self.assertGreater(float(control["0000758"]["DISTANCIA_M"]), 100000)
+
+    def test_seleccion_parcial_requiere_permiso(self):
+        sin_permiso = self.ejecutar(markers=Abridor(RespuestaFalsa(json_bytes(self.respuestas["0000758"]))),
+                                    gis_ids=["0000758"])
+
+        self.assertIn("SELECCION_PARCIAL", sin_permiso["motivos"])
+        self.assertFalse(self.actual.exists())
+
+        con_permiso = self.ejecutar(markers=Abridor(RespuestaFalsa(json_bytes(self.respuestas["0000758"]))),
+                                    gis_ids=["0000758"], permitir_parcial=True)
+
+        self.assertTrue(con_permiso["promovida"])
+        self.assertTrue(self.actual.is_dir())
+
+    def test_segunda_ejecucion_actual_pasa_a_anterior(self):
+        self.ejecutar()
+        primera = arbol(self.actual)
+
+        resultado = self.ejecutar()
+
+        self.assertTrue(resultado["promovida"])
+        self.assertTrue((self.actual / m.MARCADOR_COMPLETA).is_file())
+        self.assertFalse(self.nueva.exists())
+        self.assertEqual(
+            {k for k in arbol(self.anterior) if k.endswith(".jpg") or k.endswith(".png")},
+            {k for k in primera if k.endswith(".jpg") or k.endswith(".png")},
+        )
+        self.assertEqual(arbol(self.anterior)["IMATGES_INFOANTENAS.csv"], primera["IMATGES_INFOANTENAS.csv"])
+
+    def test_tercera_ejecucion_elimina_el_anterior_antiguo(self):
+        self.ejecutar()
+        (self.actual / "marca_v1.txt").write_text("v1", encoding="utf-8")
+        self.ejecutar()
+        (self.actual / "marca_v2.txt").write_text("v2", encoding="utf-8")
+        self.assertTrue((self.anterior / "marca_v1.txt").exists())
+
+        self.ejecutar()
+
+        self.assertTrue((self.anterior / "marca_v2.txt").exists())
+        self.assertFalse((self.anterior / "marca_v1.txt").exists())
+        self.assertFalse((self.actual / "marca_v2.txt").exists())
+
+    def test_actual_y_anterior_intactos_si_la_ejecucion_falla(self):
+        self.ejecutar()
+        self.ejecutar()
+        actual_antes, anterior_antes = arbol(self.actual), arbol(self.anterior)
+
+        resultado = self.ejecutar(imagenes=Abridor(respuesta_imagen("JPEG"), http_error(404)))
+
+        self.assertFalse(resultado["promovida"])
+        self.assertEqual(arbol(self.actual), actual_antes)
+        self.assertEqual(arbol(self.anterior), anterior_antes)
+        self.assertTrue(self.nueva.is_dir())
+        self.assertFalse((self.nueva / m.MARCADOR_COMPLETA).exists())
+
+    def test_durante_la_ejecucion_actual_no_se_modifica(self):
+        self.ejecutar()
+        antes = arbol(self.actual)
+
+        class Espia(Abridor):
+            def __call__(self_, peticion, timeout):
+                self.assertEqual(arbol(self.actual), antes)
+                self.assertTrue(self.nueva.is_dir())
+                return super().__call__(peticion, timeout)
+
+        self.ejecutar(imagenes=Espia(respuesta_imagen("JPEG"), respuesta_imagen("PNG", (500, 500))))
+
+    def test_rutas_del_csv_siguen_siendo_validas_tras_la_promocion(self):
+        self.ejecutar()
+        filas = self.leer_csv(self.actual)
+
+        self.assertTrue(filas)
+        for fila in filas:
+            for campo, subdirectorio in (("RUTA_IMAGEN", "full/"), ("RUTA_MINIATURA", "thumb/")):
+                ruta = fila[campo]
+                self.assertTrue(ruta.startswith(subdirectorio), ruta)
+                self.assertNotIn("nueva", ruta)
+                self.assertTrue((self.actual / ruta).is_file(), ruta)
+                with Image.open(self.actual / ruta) as imagen_final:
+                    imagen_final.verify()
+
+        resumen = self.leer_resumen(self.actual)
+        self.assertEqual(resumen["entradas"]["trabajo_dir"], ".")
+        self.assertEqual(resumen["entradas"]["markers_dir"], "markers")
+        self.assertNotIn("nueva", json.dumps(resumen["entradas"]))
+
+    def test_resumen_de_version(self):
+        resultado = self.ejecutar()
+        version = self.leer_resumen(self.actual)["version"]
+
+        self.assertEqual(resultado["version"], version)
+        self.assertEqual(version["inventario_sha256"], m.sha256_fichero(self.inv))
+        self.assertEqual(version["gis_id_procesados"], 3)
+        self.assertEqual(version["markers_encontrados"], 2)
+        self.assertEqual(version["markers_vacios"], 1)
+        self.assertEqual(version["errores_markers"], 0)
+        self.assertEqual(version["relaciones_imagen"], 3)
+        self.assertEqual(version["imagenes_fisicas_unicas"], 2)
+        self.assertEqual(version["imagenes_descargadas_ok"], 2)
+        self.assertEqual(version["imagenes_reutilizadas"], 0)
+        self.assertEqual(version["miniaturas_generadas"], 2)
+        self.assertEqual(version["errores_imagen"], 0)
+        self.assertEqual(version["imagenes_pendientes"], 0)
+        self.assertEqual(version["senales_bloqueo"], 0)
+        self.assertEqual(version["resultado"], "COMPLETA")
+        self.assertTrue(version["promocionable"])
+        self.assertEqual(version["motivos_no_promocionable"], [])
+        self.assertTrue(version["inicio"] <= version["fin"])
+        run = json.loads((self.actual / "run.json").read_text(encoding="utf-8"))
+        self.assertEqual(run["resultado"], "COMPLETA")
+        self.assertIn("fin", run)
+
+    def test_corte_durante_la_promocion_se_recupera_en_la_siguiente_ejecucion(self):
+        self.ejecutar()
+        llamadas = []
+
+        def renombrar_con_corte(origen, destino):
+            llamadas.append(1)
+            if len(llamadas) == 2:
+                raise OSError("corte simulado")
+            m._renombrar(origen, destino)
+
+        with self.assertRaises(OSError):
+            self.ejecutar(renombrar=renombrar_con_corte)
+
+        self.assertFalse(self.actual.exists())
+        self.assertTrue(m.version_completa(self.nueva))
+        self.assertTrue(m.version_completa(self.anterior))
+
+        mensajes = []
+        m.ejecutar_version(
+            self.inv, self.raiz, abrir=self.marcadores(), limitador=m.Limitador(0.0),
+            parametros=dict(self.params, gis_ids=None, maxim=None, maxim_imatges=None),
+            descarga={"abrir": self.imagenes_ok(), "limitador": m.Limitador(0.0),
+                      "thumb_max": 300, "reintentos": 0},
+            dormir=lambda s: None, imprimir=mensajes.append,
+        )
+
+        self.assertTrue(any("nueva -> actual" in str(x) for x in mensajes))
+        self.assertTrue(m.version_completa(self.actual))
+        self.assertTrue(m.version_completa(self.anterior))
+        self.assertFalse(self.nueva.exists())
+
+
+class TestVersionadoResume(VersionesBase):
+    def fallar_una_imagen(self):
+        return self.ejecutar(imagenes=Abridor(respuesta_imagen("JPEG"), http_error(404)))
+
+    def test_resume_reutiliza_nueva_y_completa_solo_lo_pendiente(self):
+        resultado = self.fallar_una_imagen()
+        self.assertFalse(resultado["promocionable"])
+
+        imagenes = Abridor(respuesta_imagen("PNG", (500, 500)))
+        markers = Abridor()
+        resultado = self.ejecutar(markers=markers, imagenes=imagenes, resume=True)
+
+        self.assertEqual(markers.peticiones, [])
+        self.assertEqual(len(imagenes.peticiones), 1)
+        self.assertTrue(imagenes.peticiones[0].full_url.endswith("propia.png"))
+        self.assertTrue(resultado["promovida"])
+        self.assertEqual(resultado["version"]["imagenes_reutilizadas"], 1)
+        self.assertEqual(resultado["version"]["imagenes_descargadas_ok"], 1)
+
+    def test_resume_no_usa_actual_como_fuente(self):
+        self.ejecutar()
+        self.fallar_una_imagen()
+        self.assertTrue(self.actual.is_dir())
+        # El actual ya tiene propia.png, pero el resume debe descargarla de nuevo.
+        imagenes = Abridor(respuesta_imagen("PNG", (500, 500)))
+        self.ejecutar(markers=Abridor(), imagenes=imagenes, resume=True)
+
+        self.assertEqual(len(imagenes.peticiones), 1)
+
+    def test_resume_sin_nueva_no_reanuda_desde_actual(self):
+        self.ejecutar()
+
+        with self.assertRaises(ValueError):
+            self.ejecutar(resume=True)
+
+        self.assertTrue(self.actual.is_dir())
+
+    def test_nueva_ejecucion_vuelve_a_empezar_desde_nueva_limpia(self):
+        self.ejecutar()
+        crear_version(self.nueva, "basura", completa=False)
+        (self.nueva / "full").mkdir()
+        (self.nueva / "full" / "huerfana.jpg").write_bytes(b"x")
+
+        markers, imagenes = self.marcadores(), self.imagenes_ok()
+        resultado = self.ejecutar(markers=markers, imagenes=imagenes)
+
+        self.assertEqual(len(markers.peticiones), 3)
+        self.assertEqual(len(imagenes.peticiones), 2)
+        self.assertTrue(resultado["promovida"])
+        self.assertFalse((self.actual / "full" / "huerfana.jpg").exists())
+        self.assertFalse((self.anterior / "datos.txt").exists())
+
+    def test_nueva_completa_pendiente_aborta_sin_borrar(self):
+        crear_version(self.actual, "A")
+        crear_version(self.nueva, "N")
+        antes = arbol(self.raiz)
+
+        with self.assertRaises(m.EstadoVersionesAmbiguo):
+            self.ejecutar()
+
+        self.assertEqual(arbol(self.raiz), antes)
+
+    def test_resume_rechaza_inventario_distinto(self):
+        self.fallar_una_imagen()
+        escribir_inventario(self.inv, [("0000758", "OP", 41.0, 2.0)])
+
+        with self.assertRaises(ValueError) as ctx:
+            self.ejecutar(resume=True)
+
+        self.assertIn("SHA-256", str(ctx.exception))
+        self.assertTrue(self.nueva.is_dir())
+
+    def test_resume_rechaza_parametros_de_contenido_distintos(self):
+        self.fallar_una_imagen()
+
+        with self.assertRaises(ValueError) as ctx:
+            self.ejecutar(resume=True, maxim_imagenes=1)
+
+        self.assertIn("maxim_imatges", str(ctx.exception))
+
+    def test_resume_admite_cambiar_el_ritmo(self):
+        self.fallar_una_imagen()
+        self.params = dict(self.params, timeout=99)
+
+        resultado = self.ejecutar(markers=Abridor(), imagenes=Abridor(respuesta_imagen("PNG", (500, 500))),
+                                  resume=True)
+
+        self.assertTrue(resultado["promovida"])
+
+    def test_resume_retira_completa_de_una_nueva_ya_terminada(self):
+        crear_version(self.nueva, "N")
+
+        m.preparar_nueva(self.raiz, resume=True)
+
+        self.assertFalse((self.nueva / m.MARCADOR_COMPLETA).exists())
+        self.assertTrue((self.nueva / "datos.txt").exists())
+
+
+class TestVerificacionEnDisco(VersionesBase):
+    def setUp(self):
+        super().setUp()
+        self.ejecutar()
+        self.resumen = self.leer_resumen(self.actual)
+
+    def test_version_correcta_sin_motivos(self):
+        self.assertEqual(m.verificar_version_en_disco(self.actual, self.resumen), [])
+
+    def test_detecta_miniatura_ausente(self):
+        (self.actual / "thumb" / "propia.png").unlink()
+        self.assertEqual(m.verificar_version_en_disco(self.actual, self.resumen),
+                         ["MINIATURAS_INVALIDAS:1"])
+
+    def test_detecta_original_corrupto(self):
+        (self.actual / "full" / "compartida.jpg").write_bytes(b"corrupto")
+        self.assertEqual(m.verificar_version_en_disco(self.actual, self.resumen),
+                         ["ORIGINALES_INVALIDOS:1"])
+
+    def test_detecta_ficheros_part(self):
+        (self.actual / "full" / "x.jpg.part").write_bytes(b"x")
+        self.assertEqual(m.verificar_version_en_disco(self.actual, self.resumen),
+                         ["FICHEROS_PART:1"])
+
+    def test_detecta_csv_ausente_o_incompleto(self):
+        (self.actual / "CONTROL_GIS_ID.csv").unlink()
+        motivos = m.verificar_version_en_disco(self.actual, self.resumen)
+
+        self.assertIn("FALTA_CONTROL_GIS_ID.csv", motivos)
+        self.assertIn("CONTROL_GIS_ID_INVALIDO", motivos)
+
+
+class TestCliVersionado(VersionesBase):
+    def main(self, *argumentos):
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            return m.main(["--inventario", str(self.inv), "--versiones-dir", str(self.raiz), *argumentos])
+
+    def test_incompatible_con_output_dir(self):
+        for opcion in (["--output-dir", "x"], ["--trabajo-dir", "x"], ["--imagenes-dir", "x"]):
+            with self.subTest(opcion), self.assertRaises(SystemExit):
+                self.main(*opcion)
+
+    def test_opciones_de_version_requieren_versiones_dir(self):
+        for opcion in ("--permitir-seleccion-parcial", "--promover-nueva"):
+            with self.subTest(opcion), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    m.main(["--inventario", str(self.inv), opcion])
+
+    def test_promover_nueva_completa(self):
+        crear_version(self.actual, "A")
+        crear_version(self.nueva, "N")
+
+        self.assertEqual(self.main("--promover-nueva"), 0)
+
+        self.assertEqual((self.actual / "datos.txt").read_text(encoding="utf-8"), "N")
+        self.assertEqual((self.anterior / "datos.txt").read_text(encoding="utf-8"), "A")
+
+    def test_promover_nueva_recupera_un_corte_previo(self):
+        crear_version(self.anterior, "A")
+        crear_version(self.nueva, "N")
+
+        self.assertEqual(self.main("--promover-nueva"), 0)
+
+        self.assertEqual((self.actual / "datos.txt").read_text(encoding="utf-8"), "N")
+
+    def test_promover_nueva_incompleta_falla_sin_tocar_nada(self):
+        crear_version(self.actual, "A")
+        crear_version(self.nueva, "parcial", completa=False)
+        antes = arbol(self.raiz)
+
+        with self.assertRaises(ValueError):
+            self.main("--promover-nueva")
+
+        self.assertEqual(arbol(self.raiz), antes)
+
+    def test_estado_ambiguo_devuelve_codigo_6(self):
+        crear_version(self.actual, "A", completa=False)
+        antes = arbol(self.raiz)
+
+        self.assertEqual(self.main("--promover-nueva"), 6)
+        self.assertEqual(arbol(self.raiz), antes)
+
+    def test_promover_nueva_no_admite_resume(self):
+        with self.assertRaises(SystemExit):
+            self.main("--promover-nueva", "--resume")
 
 
 if __name__ == "__main__":

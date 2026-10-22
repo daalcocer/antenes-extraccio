@@ -4,9 +4,23 @@
 """
 Extractor de imágenes de antenasmoviles para los Gis_ID de Infoantenas.
 
-FASES IMPLEMENTADAS: 1 (offline), 2 (consulta online de /v1/markers) y 3
+FASES IMPLEMENTADAS: 1 (offline), 2 (consulta online de /v1/markers), 3
 (descarga de imágenes completas y miniaturas locales, opcional con
---descargar-imagenes). Todavía no hay versionado nueva/actual/anterior.
+--descargar-imagenes) y 4 (actualización versionada con --versiones-dir).
+
+Actualización versionada (--versiones-dir RAIZ, solo online, implica imágenes):
+    RAIZ/nueva/    se genera aquí TODO: full/, thumb/, IMATGES_INFOANTENAS.csv,
+                   CONTROL_GIS_ID.csv, markers/, log_markers.csv,
+                   log_imatges.csv, run.json y resum.json
+    RAIZ/actual/   última versión válida publicada (no se toca durante la ejecución)
+    RAIZ/anterior/ copia de seguridad de la versión previa
+  Solo si la versión es promocionable (ver evaluar_version) se crea _COMPLETA, lo
+  último que se escribe, y se promociona: se elimina anterior, actual -> anterior,
+  nueva -> actual. Si no, nueva se conserva para diagnóstico o --resume y
+  actual/anterior quedan intactas. Las rutas del CSV (full/<f>, thumb/<f>) son
+  relativas a la versión, así que siguen siendo válidas tras el renombrado.
+  Una nueva ejecución (sin --resume) vuelve a consultar y descargar TODO desde
+  una nueva/ limpia; actual/ no se usa como mecanismo incremental.
 
 Dos modos; a partir de la respuesta del marker ambos siguen el mismo camino
 (parsear_marker -> cruzar -> CSV):
@@ -1253,11 +1267,20 @@ def leer_respuesta_guardada(ruta: Path, gis_id):
     return registro
 
 
-def preparar_trabajo(trabajo_dir: Path, inventario_path: Path, inventario_sha256, parametros, resume):
+def preparar_trabajo(
+    trabajo_dir: Path,
+    inventario_path: Path,
+    inventario_sha256,
+    parametros,
+    resume,
+    claves_compatibles=(),
+):
     """
     Prepara el directorio de trabajo y escribe run.json.
 
-    Con resume: exige un run.json previo con el mismo SHA-256 de inventario.
+    Con resume: exige un run.json previo con el mismo SHA-256 de inventario y,
+    si se indican claves_compatibles, los mismos valores en esos parámetros
+    (los que cambian el contenido de la extracción).
     Sin resume: descarta únicamente markers/, run.json y log_markers.csv de una
     ejecución anterior, de modo que se vuelva a consultar todo.
     """
@@ -1288,6 +1311,20 @@ def preparar_trabajo(trabajo_dir: Path, inventario_path: Path, inventario_sha256
                 f"({inventario_sha256}) no coincide con el de la ejecución "
                 f"que se quiere reanudar ({run.get('inventario_sha256')}). "
                 "Lanza una ejecución nueva sin --resume."
+            )
+
+        previos = run.get("parametros") or {}
+        diferencias = [
+            f"{clave}: antes {previos.get(clave)!r}, ahora {parametros.get(clave)!r}"
+            for clave in claves_compatibles
+            if previos.get(clave) != parametros.get(clave)
+        ]
+        if diferencias:
+            raise ValueError(
+                "No se puede reanudar: los parámetros que cambian el contenido "
+                "no coinciden con los de la ejecución original ("
+                + "; ".join(diferencias)
+                + "). Usa los mismos valores o lanza una ejecución nueva sin --resume."
             )
 
         run.setdefault("reanudaciones", []).append(
@@ -1849,6 +1886,9 @@ def procesar_imagenes(
     acciones = Counter()
     intentos_http = 0
     bytes_descargados = 0
+    descargadas_ok = 0
+    originales_reutilizados = 0
+    miniaturas_generadas = 0
     senales_bloqueo = 0
     errores_consecutivos = 0
     detenido_bloqueo = False
@@ -1903,8 +1943,16 @@ def procesar_imagenes(
             estados[r["estado"]] += 1
             acciones[r["accion"]] += 1
             intentos_http += r["intentos"]
-            if r["accion"] == ACCION_DESCARGA and r["estado"] == EST_IMG_OK:
-                bytes_descargados += r["bytes"]
+            if r["estado"] == EST_IMG_OK:
+                if r["accion"] == ACCION_DESCARGA:
+                    descargadas_ok += 1
+                    miniaturas_generadas += 1
+                    bytes_descargados += r["bytes"]
+                elif r["accion"] == ACCION_SOLO_MINIATURA:
+                    originales_reutilizados += 1
+                    miniaturas_generadas += 1
+                else:
+                    originales_reutilizados += 1
             if r["bloqueo"]:
                 senales_bloqueo += 1
 
@@ -1966,6 +2014,13 @@ def procesar_imagenes(
             "acciones": dict(sorted(acciones.items())),
             "intentos_http": intentos_http,
             "bytes_descargados": bytes_descargados,
+            "descargadas_ok": descargadas_ok,
+            "originales_reutilizados": originales_reutilizados,
+            "miniaturas_generadas": miniaturas_generadas,
+            "errores_imagen": sum(
+                n for e, n in estados.items() if e not in (EST_IMG_OK, EST_IMG_PENDIENTE)
+            ),
+            "pendientes": estados.get(EST_IMG_PENDIENTE, 0),
             "senales_bloqueo": senales_bloqueo,
             "detenido_por_bloqueo": detenido_bloqueo,
             "detenido_por_errores": detenido_errores,
@@ -1989,6 +2044,7 @@ def generar_salidas(
     estados_consulta=None,
     extra=None,
     procesar_imagenes=None,
+    nombre_resumen=None,
 ):
     """
     Camino común a offline y online: cruce, CSV y resumen.
@@ -2038,7 +2094,7 @@ def generar_salidas(
         campos_imagenes,
         (formatear_fila_imagen(f) for f in filas_imagenes),
     )
-    escribir_json_atomico(output_dir / f"resum_{modo}.json", resumen)
+    escribir_json_atomico(output_dir / (nombre_resumen or f"resum_{modo}.json"), resumen)
 
     return resumen
 
@@ -2077,6 +2133,8 @@ def ejecutar_online(
     maxim=None,
     max_errores_consecutivos=0,
     descarga=None,
+    claves_compatibles=(),
+    nombre_resumen=None,
     dormir=time.sleep,
     imprimir=print,
 ):
@@ -2088,13 +2146,16 @@ def ejecutar_online(
     descarga (opcional, Fase 3): dict con abrir, limitador, imagenes_dir,
     thumb_max, reintentos, maxim_imagenes y parar_ante_bloqueo. Si se indica,
     se descargan las imágenes y se generan las miniaturas.
+    claves_compatibles: parámetros que deben coincidir al reanudar (Fase 4).
+    nombre_resumen: nombre del resumen; por defecto resum_online.json.
     """
     inventario_completo, estadisticas_inventario = leer_inventario(inventario_path)
     inventario_sha256 = sha256_fichero(inventario_path)
     seleccion = seleccionar_gis_ids(inventario_completo, gis_ids, maxim)
 
     run = preparar_trabajo(
-        trabajo_dir, inventario_path, inventario_sha256, parametros, resume
+        trabajo_dir, inventario_path, inventario_sha256, parametros, resume,
+        claves_compatibles,
     )
     markers_dir = trabajo_dir / "markers"
 
@@ -2163,12 +2224,574 @@ def ejecutar_online(
                 "intentos_http_esta_invocacion": consulta["intentos_http"],
                 "reanudacion": bool(resume),
                 "inicio_ejecucion": run["inicio"],
+                "markers_con_elementos": sum(1 for g in seleccion if markers.get(g, {}).get("elementos")),
+                "markers_vacios": sum(
+                    1 for g in seleccion if g in markers and not markers[g]["elementos"]
+                ),
             },
         },
         procesar_imagenes=procesar,
+        nombre_resumen=nombre_resumen,
     )
 
     return resumen, consulta
+
+
+# ---------------------------------------------------------------------------
+# Versionado (Fase 4): nueva / actual / anterior
+# ---------------------------------------------------------------------------
+
+DIR_NUEVA = "nueva"
+DIR_ACTUAL = "actual"
+DIR_ANTERIOR = "anterior"
+MARCADOR_COMPLETA = "_COMPLETA"
+NOMBRE_RESUMEN_VERSION = "resum.json"
+
+# Parámetros que cambian el contenido de la extracción: deben coincidir al
+# reanudar. Ritmos, timeouts y reintentos pueden cambiar.
+CLAVES_REANUDACION = (
+    "gis_ids",
+    "maxim",
+    "maxim_imatges",
+    "miniatura_max",
+    "descargar_imagenes",
+)
+
+ARCHIVOS_VERSION = (
+    "IMATGES_INFOANTENAS.csv",
+    "CONTROL_GIS_ID.csv",
+    "log_markers.csv",
+    "log_imatges.csv",
+    "run.json",
+    NOMBRE_RESUMEN_VERSION,
+)
+
+
+class EstadoVersionesAmbiguo(Exception):
+    """El estado de nueva/actual/anterior no se puede resolver con seguridad."""
+
+
+def rutas_versiones(raiz: Path):
+    return raiz / DIR_NUEVA, raiz / DIR_ACTUAL, raiz / DIR_ANTERIOR
+
+
+def version_completa(directorio: Path):
+    return directorio.is_dir() and (directorio / MARCADOR_COMPLETA).is_file()
+
+
+def _renombrar(origen: Path, destino: Path, intentos=3, espera=1.0):
+    """os.replace con reintentos ante bloqueos transitorios de Windows."""
+    for intento in range(1, intentos + 1):
+        try:
+            os.replace(origen, destino)
+            return
+        except PermissionError:
+            if intento == intentos:
+                raise
+            time.sleep(espera)
+
+
+def _validar_tipos(raiz: Path):
+    for ruta in rutas_versiones(raiz):
+        if ruta.exists() and not ruta.is_dir():
+            raise EstadoVersionesAmbiguo(
+                f"{ruta} existe y no es un directorio. No se modifica nada; "
+                "revísalo manualmente."
+            )
+
+
+def recuperar_versiones(raiz: Path, renombrar=_renombrar):
+    """
+    Recuperación conservadora tras un corte durante la promoción. Solo actúa
+    cuando falta actual/ (las demás situaciones no se tocan):
+
+    - falta actual/ y nueva/ está completa -> nueva -> actual (se interrumpió
+      después de actual -> anterior).
+    - falta actual/, anterior/ es una versión completa y nueva/ no está
+      completa -> anterior -> actual.
+
+    Si actual/ existe se deja tal cual (nunca se recupera de forma destructiva).
+    Estados no resolubles con seguridad lanzan EstadoVersionesAmbiguo sin
+    borrar ni sobrescribir nada. Devuelve un texto con lo hecho, o None.
+    """
+    nueva, actual, anterior = rutas_versiones(raiz)
+    _validar_tipos(raiz)
+
+    if actual.exists():
+        if not version_completa(actual):
+            raise EstadoVersionesAmbiguo(
+                f"{actual} existe pero no tiene {MARCADOR_COMPLETA}: no se puede "
+                "garantizar que sea una versión válida. No se modifica nada."
+            )
+        return None
+
+    if version_completa(nueva):
+        renombrar(nueva, actual)
+        return (
+            f"Recuperación: faltaba {DIR_ACTUAL}/ y {DIR_NUEVA}/ estaba completa; "
+            f"se ha completado {DIR_NUEVA} -> {DIR_ACTUAL}."
+        )
+
+    if anterior.exists():
+        if not version_completa(anterior):
+            raise EstadoVersionesAmbiguo(
+                f"Falta {DIR_ACTUAL}/ y {anterior} no tiene {MARCADOR_COMPLETA}: "
+                "no se puede restaurar con seguridad. No se modifica nada."
+            )
+        renombrar(anterior, actual)
+        return (
+            f"Recuperación: faltaba {DIR_ACTUAL}/ y {DIR_NUEVA}/ no estaba completa; "
+            f"se ha restaurado {DIR_ANTERIOR} -> {DIR_ACTUAL}."
+        )
+
+    return None
+
+
+def promover_nueva(raiz: Path, renombrar=_renombrar):
+    """
+    Promociona nueva/ a actual/. Solo si nueva/ contiene _COMPLETA:
+    1. elimina anterior/ (si existe),
+    2. renombra actual/ -> anterior/ (si existe),
+    3. renombra nueva/ -> actual/.
+    """
+    nueva, actual, anterior = rutas_versiones(raiz)
+    _validar_tipos(raiz)
+
+    if not version_completa(nueva):
+        raise ValueError(
+            f"{nueva} no está completa (falta {MARCADOR_COMPLETA}): no se promociona."
+        )
+
+    if actual.exists() and not version_completa(actual):
+        raise EstadoVersionesAmbiguo(
+            f"{actual} existe pero no tiene {MARCADOR_COMPLETA}: no se sustituye "
+            "automáticamente. No se modifica nada."
+        )
+
+    if anterior.exists():
+        # Se invalida antes de borrar para que un borrado interrumpido no deje
+        # un anterior/ que parezca una versión válida.
+        (anterior / MARCADOR_COMPLETA).unlink(missing_ok=True)
+        shutil.rmtree(anterior)
+
+    if actual.exists():
+        renombrar(actual, anterior)
+
+    renombrar(nueva, actual)
+
+
+def preparar_nueva(raiz: Path, resume):
+    """
+    Prepara nueva/. Sin resume: una nueva/ incompleta se elimina y se empieza de
+    cero; una nueva/ completa pendiente de promocionar no se borra (se aborta).
+    Con resume: se conserva el contenido y se retira _COMPLETA, porque la
+    versión vuelve a estar en curso. actual/ y anterior/ no se tocan.
+    """
+    nueva, _, _ = rutas_versiones(raiz)
+    _validar_tipos(raiz)
+
+    if resume:
+        if not nueva.is_dir():
+            raise ValueError(f"No hay {nueva} que reanudar.")
+
+        (nueva / MARCADOR_COMPLETA).unlink(missing_ok=True)
+        return nueva
+
+    if nueva.exists():
+        if version_completa(nueva):
+            raise EstadoVersionesAmbiguo(
+                f"{nueva} está completa y pendiente de promocionar. Usa "
+                "--promover-nueva para promocionarla, o bórrala manualmente si "
+                "quieres descartarla. No se modifica nada."
+            )
+
+        shutil.rmtree(nueva)
+
+    nueva.mkdir(parents=True)
+    return nueva
+
+
+def _imagen_legible(ruta: Path):
+    _exigir_pillow()
+
+    try:
+        with Image.open(ruta) as img:
+            img.verify()
+        return True
+    except Exception:
+        return False
+
+
+def _leer_filas_csv(ruta: Path, campos):
+    try:
+        with ruta.open("r", encoding="utf-8-sig", newline="") as f:
+            lector = csv.DictReader(f, delimiter=";")
+
+            if lector.fieldnames != list(campos):
+                return None
+
+            return list(lector)
+    except (OSError, csv.Error, UnicodeDecodeError):
+        return None
+
+
+def verificar_version_en_disco(version_dir: Path, resumen):
+    """Comprueba que la versión es coherente en disco. Devuelve la lista de motivos."""
+    motivos = []
+
+    for nombre in ARCHIVOS_VERSION:
+        if not (version_dir / nombre).is_file():
+            motivos.append(f"FALTA_{nombre}")
+
+    partes = list(version_dir.rglob("*.part"))
+    if partes:
+        motivos.append(f"FICHEROS_PART:{len(partes)}")
+
+    control = _leer_filas_csv(version_dir / "CONTROL_GIS_ID.csv", CAMPOS_CONTROL)
+    imagenes = _leer_filas_csv(
+        version_dir / "IMATGES_INFOANTENAS.csv", CAMPOS_IMAGENES + CAMPOS_DESCARGA
+    )
+
+    if control is None:
+        motivos.append("CONTROL_GIS_ID_INVALIDO")
+    elif len(control) != resumen["inventario"]["gis_id_unicos"]:
+        motivos.append("CONTROL_GIS_ID_INCONSISTENTE")
+
+    if imagenes is None:
+        motivos.append("IMATGES_INFOANTENAS_INVALIDO")
+        return motivos
+
+    if len(imagenes) != resumen["imagenes"]["relaciones_gis_id_imagen"]:
+        motivos.append("IMATGES_INFOANTENAS_INCONSISTENTE")
+
+    rutas_invalidas = 0
+    originales_malos = set()
+    miniaturas_malas = set()
+
+    for fila in imagenes:
+        if fila["ESTADO_DESCARGA"] != EST_IMG_OK:
+            continue
+
+        for campo, malos in (("RUTA_IMAGEN", originales_malos), ("RUTA_MINIATURA", miniaturas_malas)):
+            ruta = fila[campo]
+            partes_ruta = Path(ruta).parts
+
+            if not ruta or Path(ruta).is_absolute() or ":" in ruta or ".." in partes_ruta:
+                rutas_invalidas += 1
+            elif ruta not in malos and not _imagen_legible(version_dir / ruta):
+                malos.add(ruta)
+
+    if rutas_invalidas:
+        motivos.append(f"RUTAS_NO_RELATIVAS_O_VACIAS:{rutas_invalidas}")
+    if originales_malos:
+        motivos.append(f"ORIGINALES_INVALIDOS:{len(originales_malos)}")
+    if miniaturas_malas:
+        motivos.append(f"MINIATURAS_INVALIDAS:{len(miniaturas_malas)}")
+
+    return motivos
+
+
+def evaluar_version(version_dir: Path, resumen, consulta, *, parcial, permitir_parcial):
+    """
+    Motivos por los que la versión NO es promocionable (lista vacía = promocionable).
+
+    No son fallo: HTTP 200 + [], un Gis_ID sin imágenes, old=1, desmantelada=1,
+    distancia elevada ni operador distinto (son datos de control).
+    """
+    motivos = []
+
+    if consulta["detenido"]:
+        motivos.append("CONSULTA_DETENIDA_POR_ERRORES")
+
+    errores_markers = {
+        e: n for e, n in consulta["contadores"].items() if e in ESTADOS_ERROR_TECNICO
+    }
+    if errores_markers:
+        motivos.append(f"ERRORES_MARKERS:{sum(errores_markers.values())}")
+
+    if resumen is None:
+        return motivos
+
+    descarga = resumen.get("descarga")
+
+    if descarga is None:
+        motivos.append("SIN_DESCARGA_DE_IMAGENES")
+    else:
+        errores_imagen = {
+            e: n for e, n in descarga["estados"].items()
+            if e not in (EST_IMG_OK, EST_IMG_PENDIENTE)
+        }
+        if errores_imagen:
+            motivos.append(f"ERRORES_IMAGEN:{sum(errores_imagen.values())}")
+        if descarga["estados"].get(EST_IMG_PENDIENTE):
+            motivos.append(f"IMAGENES_PENDIENTES:{descarga['estados'][EST_IMG_PENDIENTE]}")
+        if descarga["detenido_por_bloqueo"]:
+            motivos.append("BLOQUEO_DETECTADO")
+        if descarga["detenido_por_errores"]:
+            motivos.append("DESCARGA_DETENIDA_POR_ERRORES")
+
+    if parcial and not permitir_parcial:
+        motivos.append("SELECCION_PARCIAL")
+
+    if descarga is not None:
+        motivos.extend(verificar_version_en_disco(version_dir, resumen))
+
+    return motivos
+
+
+def construir_bloque_version(resumen, consulta, *, inventario_sha256, inicio, fin, parcial, motivos):
+    descarga = resumen.get("descarga", {}) if resumen else {}
+    promocionable = not motivos
+
+    return {
+        "inventario_sha256": inventario_sha256,
+        "inicio": inicio,
+        "fin": fin,
+        "gis_id_procesados": len(consulta["estados"]),
+        "markers_encontrados": resumen["cruce"]["gis_id_encontrados"] if resumen else None,
+        "markers_vacios": resumen["consulta"]["markers_vacios"] if resumen else None,
+        "errores_markers": sum(
+            n for e, n in consulta["contadores"].items() if e in ESTADOS_ERROR_TECNICO
+        ),
+        "relaciones_imagen": descarga.get("relaciones_gis_id_imagen"),
+        "imagenes_fisicas_unicas": descarga.get("ficheros_unicos"),
+        "imagenes_descargadas_ok": descarga.get("descargadas_ok"),
+        "imagenes_reutilizadas": descarga.get("originales_reutilizados"),
+        "miniaturas_generadas": descarga.get("miniaturas_generadas"),
+        "errores_imagen": descarga.get("errores_imagen"),
+        "imagenes_pendientes": descarga.get("pendientes"),
+        "senales_bloqueo": descarga.get("senales_bloqueo"),
+        "seleccion_parcial": parcial,
+        "resultado": "COMPLETA" if promocionable else "NO_PROMOCIONABLE",
+        "promocionable": promocionable,
+        "motivos_no_promocionable": motivos,
+    }
+
+
+def crear_completa(version_dir: Path, metadatos):
+    """Crea _COMPLETA. Debe ser lo ÚLTIMO que se escribe dentro de la versión."""
+    escribir_json_atomico(version_dir / MARCADOR_COMPLETA, metadatos, sufijo=".part")
+
+
+def ejecutar_version(
+    inventario_path: Path,
+    raiz: Path,
+    *,
+    abrir,
+    limitador,
+    parametros,
+    descarga,
+    resume=False,
+    gis_ids=None,
+    maxim=None,
+    max_errores_consecutivos=0,
+    permitir_parcial=False,
+    renombrar=_renombrar,
+    dormir=time.sleep,
+    imprimir=print,
+):
+    """
+    Actualización versionada. Todo se genera dentro de <raiz>/nueva/ (imágenes,
+    miniaturas, CSV, logs, run.json y resum.json) sin tocar actual/ ni
+    anterior/. Solo si la versión es promocionable se crea _COMPLETA (lo último)
+    y se promociona (anterior se elimina, actual -> anterior, nueva -> actual).
+    Si no, nueva/ se conserva para diagnóstico o --resume.
+
+    Devuelve {"promocionable", "promovida", "motivos", "version", "recuperacion"}.
+    """
+    raiz.mkdir(parents=True, exist_ok=True)
+
+    recuperacion = recuperar_versiones(raiz, renombrar)
+    if recuperacion:
+        imprimir(recuperacion)
+
+    nueva = preparar_nueva(raiz, resume)
+    inventario_sha256 = sha256_fichero(inventario_path)
+
+    resumen, consulta = ejecutar_online(
+        inventario_path,
+        nueva,
+        nueva,
+        abrir=abrir,
+        limitador=limitador,
+        parametros=parametros,
+        resume=resume,
+        gis_ids=gis_ids,
+        maxim=maxim,
+        max_errores_consecutivos=max_errores_consecutivos,
+        descarga={**descarga, "imagenes_dir": nueva},
+        claves_compatibles=CLAVES_REANUDACION,
+        nombre_resumen=NOMBRE_RESUMEN_VERSION,
+        dormir=dormir,
+        imprimir=imprimir,
+    )
+
+    run_path = nueva / "run.json"
+    run = json.loads(run_path.read_text(encoding="utf-8"))
+
+    parcial = bool(
+        descarga.get("maxim_imagenes") is not None
+        or (
+            resumen is not None
+            and resumen["seleccion"]["gis_id_seleccionados"]
+            < resumen["seleccion"]["gis_id_en_inventario"]
+        )
+        or (resumen is None and (gis_ids or maxim is not None))
+    )
+
+    motivos = evaluar_version(
+        nueva, resumen, consulta, parcial=parcial, permitir_parcial=permitir_parcial
+    )
+    fin = datetime.now().isoformat(timespec="seconds")
+    bloque = construir_bloque_version(
+        resumen,
+        consulta,
+        inventario_sha256=inventario_sha256,
+        inicio=run["inicio"],
+        fin=fin,
+        parcial=parcial,
+        motivos=motivos,
+    )
+
+    if resumen is None:
+        resumen_final = {"modo": "online", "version": bloque}
+    else:
+        resumen_final = dict(resumen)
+        # Rutas relativas a la versión: siguen siendo válidas tras renombrarla.
+        resumen_final["entradas"] = {
+            **resumen["entradas"],
+            "markers_dir": "markers",
+            "trabajo_dir": ".",
+        }
+        resumen_final["version"] = bloque
+
+    escribir_json_atomico(nueva / NOMBRE_RESUMEN_VERSION, resumen_final)
+    run.update(
+        fin=fin,
+        resultado=bloque["resultado"],
+        promocionable=bloque["promocionable"],
+        motivos_no_promocionable=motivos,
+    )
+    escribir_json_atomico(run_path, run, sufijo=".part")
+
+    promovida = False
+    if not motivos:
+        crear_completa(
+            nueva,
+            {
+                "finalizado_en": fin,
+                "inventario_sha256": inventario_sha256,
+                "resultado": bloque["resultado"],
+            },
+        )
+        promover_nueva(raiz, renombrar)
+        promovida = True
+
+    return {
+        "promocionable": bloque["promocionable"],
+        "promovida": promovida,
+        "motivos": motivos,
+        "version": bloque,
+        "recuperacion": recuperacion,
+    }
+
+
+def codigo_salida_version(resultado):
+    """0 promovida; 4 bloqueo; 3 detenida; 2 errores técnicos; 5 otro motivo."""
+    if resultado["promocionable"]:
+        return 0
+
+    motivos = resultado["motivos"]
+
+    if any(m.startswith("BLOQUEO") for m in motivos):
+        return 4
+    if any(m.startswith(("CONSULTA_DETENIDA", "DESCARGA_DETENIDA")) for m in motivos):
+        return 3
+    if any(m.startswith("ERRORES_") for m in motivos):
+        return 2
+    return 5
+
+
+def _main_version(args, inventario_path: Path):
+    """Actualización versionada desde la línea de comandos. Devuelve el código de salida."""
+    raiz = Path(args.versiones_dir)
+
+    if args.promover_nueva:
+        try:
+            recuperacion = recuperar_versiones(raiz)
+
+            if recuperacion:
+                print(recuperacion)
+
+            if recuperacion and not (raiz / DIR_NUEVA).exists():
+                return 0
+
+            promover_nueva(raiz)
+        except EstadoVersionesAmbiguo as exc:
+            print(f"ERROR de versiones: {exc}", file=sys.stderr)
+            return 6
+
+        print(f"Promocionada {raiz / DIR_NUEVA} -> {raiz / DIR_ACTUAL}.")
+        return 0
+
+    parametros = {
+        "peticions_per_minut": args.peticions_per_minut,
+        "timeout": args.timeout,
+        "reintentos": args.reintents,
+        "maxim": args.maxim,
+        "gis_ids": args.gis_ids,
+        "max_errores_consecutivos": args.max_errores_consecutivos,
+        "descargar_imagenes": True,
+        "imatges_per_minut": args.imatges_per_minut,
+        "imatges_reintentos": args.imatges_reintents,
+        "miniatura_max": args.miniatura_max,
+        "maxim_imatges": args.maxim_imatges,
+        "parar_ante_bloqueo": args.parar_ante_bloqueo,
+        "versionado": True,
+    }
+    abrir = crear_apertura()
+    descarga = {
+        "abrir": abrir,
+        "limitador": Limitador(60.0 / args.imatges_per_minut),
+        "thumb_max": args.miniatura_max,
+        "reintentos": args.imatges_reintents,
+        "maxim_imagenes": args.maxim_imatges,
+        "parar_ante_bloqueo": args.parar_ante_bloqueo,
+    }
+
+    print(f"Versiones: {raiz} (se genera en {raiz / DIR_NUEVA})")
+    print(f"Ritmo: {args.peticions_per_minut:g} peticiones/minuto; imágenes: "
+          f"{args.imatges_per_minut:g} descargas/minuto")
+
+    try:
+        resultado = ejecutar_version(
+            inventario_path,
+            raiz,
+            abrir=abrir,
+            limitador=Limitador(60.0 / args.peticions_per_minut),
+            parametros=parametros,
+            descarga=descarga,
+            resume=args.resume,
+            gis_ids=args.gis_ids,
+            maxim=args.maxim,
+            max_errores_consecutivos=args.max_errores_consecutivos,
+            permitir_parcial=args.permitir_seleccion_parcial,
+        )
+    except EstadoVersionesAmbiguo as exc:
+        print(f"ERROR de versiones: {exc}", file=sys.stderr)
+        return 6
+
+    print(json.dumps(resultado, ensure_ascii=False, indent=2))
+
+    if resultado["promovida"]:
+        print(f"Versión promocionada: {raiz / DIR_ACTUAL}")
+    else:
+        print(
+            f"Versión NO promocionable. Se conserva {raiz / DIR_NUEVA} para "
+            "diagnóstico o --resume; actual/ y anterior/ no se han tocado."
+        )
+
+    return codigo_salida_version(resultado)
 
 
 def main(argv=None):
@@ -2181,7 +2804,10 @@ def main(argv=None):
     parser.add_argument("--modo", choices=("offline", "online"), default="offline")
     parser.add_argument("--inventario", default=DEFAULT_INVENTARIO)
     parser.add_argument("--raw", default=DEFAULT_RAW, help="Solo offline.")
-    parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument(
+        "--output-dir",
+        help=f"Análisis sin versionado. Por defecto: {DEFAULT_OUTPUT_DIR}.",
+    )
     parser.add_argument(
         "--trabajo-dir",
         help="Solo online. Por defecto: <output-dir>/_treball.",
@@ -2264,7 +2890,48 @@ def main(argv=None):
             "sin reintentar ni seguir con otras imágenes."
         ),
     )
+    parser.add_argument(
+        "--versiones-dir",
+        help=(
+            "Actualización versionada (solo online; implica --descargar-imagenes). "
+            "Genera todo en <dir>/nueva y solo si es válida la promociona: "
+            "actual -> anterior, nueva -> actual. Incompatible con --output-dir, "
+            "--trabajo-dir e --imagenes-dir."
+        ),
+    )
+    parser.add_argument(
+        "--permitir-seleccion-parcial",
+        action="store_true",
+        help=(
+            "Con --versiones-dir: permite promocionar una versión de una selección "
+            "parcial (--gis-id, --maxim). Solo para pruebas."
+        ),
+    )
+    parser.add_argument(
+        "--promover-nueva",
+        action="store_true",
+        help=(
+            "Con --versiones-dir: sin consultar nada, recupera un corte previo y "
+            "promociona nueva/ si contiene _COMPLETA."
+        ),
+    )
     args = parser.parse_args(argv)
+
+    versionado = bool(args.versiones_dir)
+
+    if versionado:
+        if args.output_dir or args.trabajo_dir or args.imagenes_dir:
+            parser.error(
+                "--versiones-dir es incompatible con --output-dir, --trabajo-dir "
+                "e --imagenes-dir (todo se genera dentro de <versiones-dir>/nueva)."
+            )
+        args.modo = "online"
+        args.descargar_imagenes = True
+    elif args.permitir_seleccion_parcial or args.promover_nueva:
+        parser.error("--permitir-seleccion-parcial y --promover-nueva requieren --versiones-dir.")
+
+    if args.promover_nueva and (args.resume or args.gis_ids or args.maxim is not None):
+        parser.error("--promover-nueva no consulta nada: no admite --resume, --gis-id ni --maxim.")
 
     solo_online = (
         args.resume
@@ -2303,10 +2970,13 @@ def main(argv=None):
         parser.error("--max-errores-consecutivos no puede ser negativo.")
 
     inventario_path = Path(args.inventario)
-    output_dir = Path(args.output_dir)
+    output_dir = Path(args.output_dir or DEFAULT_OUTPUT_DIR)
 
     if not inventario_path.is_file():
         raise FileNotFoundError(f"No existe el inventario: {inventario_path}")
+
+    if versionado:
+        return _main_version(args, inventario_path)
 
     if args.modo == "offline":
         raw_path = Path(args.raw)
