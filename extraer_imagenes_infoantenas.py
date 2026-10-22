@@ -4,8 +4,9 @@
 """
 Extractor de imágenes de antenasmoviles para los Gis_ID de Infoantenas.
 
-FASES IMPLEMENTADAS: 1 (offline) y 2 (consulta online de /v1/markers).
-Todavía no descarga imágenes, no genera miniaturas ni versiona carpetas.
+FASES IMPLEMENTADAS: 1 (offline), 2 (consulta online de /v1/markers) y 3
+(descarga de imágenes completas y miniaturas locales, opcional con
+--descargar-imagenes). Todavía no hay versionado nueva/actual/anterior.
 
 Dos modos; a partir de la respuesta del marker ambos siguen el mismo camino
 (parsear_marker -> cruzar -> CSV):
@@ -25,6 +26,20 @@ las respuestas válidas ya guardadas y consulta únicamente las pendientes. Sin
 --resume se descarta el estado previo del directorio de trabajo y se vuelve a
 consultar todo (no hay lógica incremental entre ejecuciones).
 
+Imágenes (--descargar-imagenes, solo online):
+  Cada fichero físico se descarga UNA vez por ejecución aunque lo compartan
+  varios Gis_ID (el CSV mantiene una fila por relación). Descarga secuencial a
+  <imagenes>/full/<fichero>, siempre vía .part y validada (HTTP 200,
+  Content-Type de imagen, no vacía, decodificable con Pillow). La miniatura
+  (<imagenes>/thumb/) se genera localmente a partir de la completa; nunca se
+  descarga. Ritmo propio (--imatges-per-minut), independiente de /markers.
+  Las imágenes old/desmantelada y la distancia/operador NO excluyen ninguna
+  descarga. Con --resume: original y miniatura válidos se reutilizan, si falta
+  solo la miniatura se regenera, y un original ausente o corrupto se vuelve a
+  descargar. Salidas extra: RUTA_IMAGEN, RUTA_MINIATURA (relativas a
+  <imagenes>) y ESTADO_DESCARGA en IMATGES_INFOANTENAS.csv, y log_imatges.csv
+  (una fila por fichero único) en el directorio de trabajo.
+
 Reglas:
 - Gis_ID siempre como texto literal (sin quitar ceros ni normalizar).
 - El cruce es solo por coincidencia literal de código.
@@ -40,6 +55,7 @@ import http.client
 import json
 import math
 import os
+import re
 import shutil
 import ssl
 import sys
@@ -56,6 +72,12 @@ try:
     import truststore
 except ImportError:
     truststore = None
+
+try:
+    from PIL import Image, ImageOps
+except ImportError:
+    Image = None
+    ImageOps = None
 
 IMAGE_PREFIX = "https://antenasmoviles.es/archive/antenas/"
 MARKERS_URL = "https://antenasmoviles.es/v1/markers"
@@ -102,8 +124,55 @@ CABECERAS_RELEVANTES = {
     "date", "content-type", "content-length", "content-encoding",
     "transfer-encoding", "server", "retry-after", "etag", "last-modified",
     "cache-control", "expires", "age", "location", "cf-cache-status", "cf-ray",
+    "cf-mitigated",
 }
 PREFIJOS_RATELIMIT = ("x-ratelimit", "ratelimit")
+MARCAS_DESAFIO = (b"just a moment", b"cf-chl", b"attention required", b"cf-browser-verification")
+MAX_CUERPO_ERROR = 1024 * 1024
+
+# Descarga de imágenes (Fase 3).
+DEFAULT_IMATGES_PER_MINUT = 5.0
+DEFAULT_IMATGES_REINTENTS = 2
+DEFAULT_MINIATURA_MAX = 300
+MAX_BYTES_IMAGEN = 50 * 1024 * 1024
+TAMANO_BLOQUE = 64 * 1024
+IMAGEN_ACCEPT = "image/jpeg,image/png,image/*;q=0.8"
+
+# Estados de la descarga de una imagen (log_imatges.csv y ESTADO_DESCARGA).
+EST_IMG_OK = "OK"
+EST_IMG_HTTP_ERROR = "HTTP_ERROR"
+EST_IMG_CONTENT_TYPE_INVALIDO = "CONTENT_TYPE_INVALIDO"
+EST_IMG_VACIA = "VACIA"
+EST_IMG_CORRUPTA = "IMAGEN_CORRUPTA"
+EST_IMG_ERROR_RED = "ERROR_RED"
+EST_IMG_PENDIENTE = "PENDIENTE"  # no intentada (fuera de selección o ejecución detenida)
+
+ACCION_DESCARGA = "DESCARGA"
+ACCION_REUTILIZADA = "REUTILIZADA"
+ACCION_SOLO_MINIATURA = "SOLO_MINIATURA"
+
+CAMPOS_DESCARGA = ["RUTA_IMAGEN", "RUTA_MINIATURA", "ESTADO_DESCARGA"]
+
+CAMPOS_LOG_IMAGENES = [
+    "MOMENTO",
+    "ID_IMAGEN_ORIGEN",
+    "NOMBRE_FICHERO",
+    "NOMBRE_LOCAL",
+    "URL_ORIGEN",
+    "ESTADO",
+    "ACCION",
+    "HTTP_STATUS",
+    "INTENTOS",
+    "CONTENT_TYPE",
+    "BYTES",
+    "FORMATO",
+    "ANCHO",
+    "ALTO",
+    "MINIATURA_ANCHO",
+    "MINIATURA_ALTO",
+    "CABECERAS",
+    "ERROR",
+]
 
 CAMPOS_LOG = [
     "MOMENTO",
@@ -639,7 +708,7 @@ def cruzar(inventario, markers, estados_consulta=None):
                         "AUTOR": imagen["autor"],
                         "FECHA_FOTO": imagen["fecha_foto"],
                         "FECHA_SUBIDA": imagen["fecha_subida"],
-                        "URL_ORIGEN": IMAGE_PREFIX + imagen["fichero"],
+                        "URL_ORIGEN": construir_url_imagen(imagen["fichero"]),
                         "OLD": imagen["old"],
                         "DESMANTELADA": imagen["desmantelada"],
                         "LAT_SUBIDA": imagen["lat_subida"],
@@ -945,6 +1014,135 @@ def _espera_backoff(intento):
     return min(10 * (2 ** (intento - 1)), ESPERA_MAXIMA_S)
 
 
+def detectar_bloqueo(status, headers, cuerpo=b""):
+    """Señales de rate limiting o de bloqueo (incluye el desafío de Cloudflare)."""
+    if status in (403, 429):
+        return True
+
+    if headers and headers.get("cf-mitigated"):
+        return True
+
+    muestra = cuerpo[:4096].lower()
+    return status in (200, 503) and any(marca in muestra for marca in MARCAS_DESAFIO)
+
+
+def ejecutar_peticion(
+    peticion,
+    abrir,
+    limitador,
+    resultado,
+    leer,
+    *,
+    timeout,
+    reintentos,
+    dormir,
+    imprimir,
+    estado_http,
+    estado_red,
+    estado_recuperable,
+    parar_ante_bloqueo=False,
+):
+    """
+    Bucle común de petición con reintentos para marcadores e imágenes.
+
+    leer(respuesta) se ejecuta dentro del contexto de la respuesta y rellena
+    resultado (estado, bytes, ...). Reintenta HTTP 429 (respetando
+    Retry-After), 5xx y errores de red; el resto de HTTP es definitivo
+    (estado_http(status)). Con parar_ante_bloqueo no se reintenta ante una
+    señal de bloqueo. Si Retry-After supera ESPERA_MAXIMA_S tampoco se
+    reintenta y se marca resultado["bloqueo"].
+    """
+    resultado["bloqueo"] = False
+
+    for intento in range(1, reintentos + 2):
+        resultado.update(
+            estado=None,
+            http_status="",
+            bytes="",
+            content_type="",
+            cabeceras={},
+            error="",
+            muestra="",
+        )
+        limitador.esperar()
+        resultado["intentos"] = intento
+        limitador.marcar()
+        espera = None
+
+        try:
+            with abrir(peticion, timeout) as respuesta:
+                leer(respuesta)
+
+            return resultado
+
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            headers = exc.headers
+            try:
+                cuerpo = exc.read(MAX_CUERPO_ERROR)
+            except Exception:
+                cuerpo = b""
+            finally:
+                exc.close()
+
+            _registrar_respuesta(resultado, status, headers, cuerpo)
+            bloqueo = detectar_bloqueo(status, headers, cuerpo)
+            resultado["bloqueo"] = bloqueo
+
+            if status == 429:
+                retry_after = obtener_retry_after(headers)
+
+                if retry_after is not None and retry_after > ESPERA_MAXIMA_S:
+                    resultado["bloqueo"] = True
+                    resultado.update(
+                        estado=estado_recuperable,
+                        error=f"HTTP 429 con Retry-After de {retry_after:.0f}s (no se espera).",
+                    )
+                    return resultado
+
+                espera = (
+                    max(limitador.intervalo_s, retry_after)
+                    if retry_after is not None
+                    else min(ESPERA_429_POR_DEFECTO_S * intento, ESPERA_MAXIMA_S)
+                )
+                resultado.update(estado=estado_recuperable, error="HTTP 429")
+            elif 500 <= status <= 599:
+                espera = _espera_backoff(intento)
+                resultado.update(estado=estado_recuperable, error=f"HTTP {status}")
+            else:
+                resultado.update(
+                    estado=estado_http(status),
+                    error=f"HTTP {status}: {exc.reason}",
+                )
+                return resultado
+
+            if bloqueo and parar_ante_bloqueo:
+                return resultado
+
+        except (urllib.error.URLError, http.client.HTTPException, OSError) as exc:
+            motivo = getattr(exc, "reason", None) or exc
+            resultado.update(
+                estado=estado_red,
+                error=f"{type(exc).__name__}: {motivo}",
+            )
+            espera = _espera_backoff(intento)
+
+        if intento <= reintentos:
+            imprimir(
+                f"      {resultado['error']}. Reintento {intento}/{reintentos} "
+                f"en {espera:.0f}s..."
+            )
+            dormir(espera)
+
+    return resultado
+
+
+def _estado_http_marker(status):
+    if status in HTTP_NO_ENCONTRADO:
+        return EST_HTTP_NO_ENCONTRADO
+    return EST_HTTP_NO_RECUPERABLE
+
+
 def consultar_marker(
     gis_id,
     abrir,
@@ -974,95 +1172,37 @@ def consultar_marker(
     )
     resultado = {"url": url, "intentos": 0, "data": None}
 
-    for intento in range(1, reintentos + 2):
-        resultado.update(
-            estado=None,
-            http_status="",
-            bytes="",
-            content_type="",
-            cabeceras={},
-            error="",
-            muestra="",
-        )
-        limitador.esperar()
-        resultado["intentos"] = intento
-        limitador.marcar()
-        espera = None
+    def leer(respuesta):
+        cuerpo = respuesta.read()
+        _registrar_respuesta(resultado, respuesta.status, respuesta.headers, cuerpo)
 
-        try:
-            with abrir(peticion, timeout) as respuesta:
-                status = respuesta.status
-                headers = respuesta.headers
-                cuerpo = respuesta.read()
-
-        except urllib.error.HTTPError as exc:
-            status = exc.code
-            headers = exc.headers
-            try:
-                cuerpo = exc.read()
-            except Exception:
-                cuerpo = b""
-            finally:
-                exc.close()
-
-            _registrar_respuesta(resultado, status, headers, cuerpo)
-
-            if status == 429:
-                retry_after = obtener_retry_after(headers)
-                espera = (
-                    max(limitador.intervalo_s, retry_after)
-                    if retry_after is not None
-                    else min(ESPERA_429_POR_DEFECTO_S * intento, ESPERA_MAXIMA_S)
-                )
-                resultado.update(estado=EST_ERROR_HTTP_RECUPERABLE, error="HTTP 429")
-            elif 500 <= status <= 599:
-                espera = _espera_backoff(intento)
-                resultado.update(
-                    estado=EST_ERROR_HTTP_RECUPERABLE, error=f"HTTP {status}"
-                )
-            else:
-                resultado.update(
-                    estado=(
-                        EST_HTTP_NO_ENCONTRADO
-                        if status in HTTP_NO_ENCONTRADO
-                        else EST_HTTP_NO_RECUPERABLE
-                    ),
-                    error=f"HTTP {status}: {exc.reason}",
-                )
-                return resultado
-
-        except (urllib.error.URLError, http.client.HTTPException, OSError) as exc:
-            motivo = getattr(exc, "reason", None) or exc
+        if respuesta.status != 200:
             resultado.update(
-                estado=EST_ERROR_RED,
-                error=f"{type(exc).__name__}: {motivo}",
+                estado=EST_HTTP_NO_RECUPERABLE,
+                error=f"HTTP {respuesta.status} inesperado.",
             )
-            espera = _espera_backoff(intento)
+            return
 
-        else:
-            _registrar_respuesta(resultado, status, headers, cuerpo)
+        estado, data, error = clasificar_cuerpo(
+            cuerpo,
+            respuesta.headers.get_content_charset() if respuesta.headers else None,
+        )
+        resultado.update(estado=estado, data=data, error=error)
 
-            if status != 200:
-                resultado.update(
-                    estado=EST_HTTP_NO_RECUPERABLE,
-                    error=f"HTTP {status} inesperado.",
-                )
-                return resultado
-
-            estado, data, error = clasificar_cuerpo(
-                cuerpo, headers.get_content_charset() if headers else None
-            )
-            resultado.update(estado=estado, data=data, error=error)
-            return resultado
-
-        if intento <= reintentos:
-            imprimir(
-                f"      {resultado['error']}. Reintento {intento}/{reintentos} "
-                f"en {espera:.0f}s..."
-            )
-            dormir(espera)
-
-    return resultado
+    return ejecutar_peticion(
+        peticion,
+        abrir,
+        limitador,
+        resultado,
+        leer,
+        timeout=timeout,
+        reintentos=reintentos,
+        dormir=dormir,
+        imprimir=imprimir,
+        estado_http=_estado_http_marker,
+        estado_red=EST_ERROR_RED,
+        estado_recuperable=EST_ERROR_HTTP_RECUPERABLE,
+    )
 
 
 def _registrar_respuesta(resultado, status, headers, cuerpo):
@@ -1159,7 +1299,11 @@ def preparar_trabajo(trabajo_dir: Path, inventario_path: Path, inventario_sha256
         if markers_dir.exists():
             shutil.rmtree(markers_dir)
 
-        for antiguo in (run_path, trabajo_dir / "log_markers.csv"):
+        for antiguo in (
+            run_path,
+            trabajo_dir / "log_markers.csv",
+            trabajo_dir / "log_imatges.csv",
+        ):
             antiguo.unlink(missing_ok=True)
 
         run = {
@@ -1305,6 +1449,532 @@ def consultar_pendientes(
 
 
 # ---------------------------------------------------------------------------
+# Imágenes (Fase 3): descarga, validación y miniaturas locales
+# ---------------------------------------------------------------------------
+
+class ImagenInvalida(Exception):
+    """La imagen no se puede abrir, decodificar o convertir en miniatura."""
+
+
+class ErrorEscrituraLocal(Exception):
+    """Fallo de disco local: no es un error de red y no se reintenta."""
+
+
+_NOMBRE_SEGURO = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]*")
+
+
+def construir_url_imagen(fichero):
+    """URL de la imagen completa (los nombres habituales no cambian al codificarse)."""
+    return IMAGE_PREFIX + urllib.parse.quote(fichero, safe="")
+
+
+def nombre_local_seguro(fichero):
+    """
+    Nombre de fichero local. Se conserva el original; solo si pudiera salirse
+    del directorio o no ser válido en disco se codifica y se añade un hash.
+    """
+    if _NOMBRE_SEGURO.fullmatch(fichero):
+        return fichero
+
+    resumen = hashlib.sha256(fichero.encode("utf-8")).hexdigest()[:12]
+    return f"{urllib.parse.quote(fichero, safe='')[:120]}_{resumen}"
+
+
+def content_type_es_imagen(content_type):
+    return content_type.split(";")[0].strip().lower().startswith("image/")
+
+
+def _exigir_pillow():
+    if Image is None:
+        raise RuntimeError(
+            "Pillow no está instalado. Ejecuta: python -m pip install -r requirements.txt"
+        )
+
+
+def inspeccionar_imagen(ruta: Path):
+    """
+    Valida con Pillow (verify y decodificación completa, para detectar
+    truncados) sin fiarse de la extensión. Devuelve formato, ancho y alto.
+    """
+    _exigir_pillow()
+
+    try:
+        with Image.open(ruta) as img:
+            formato = img.format
+            ancho, alto = img.size
+            img.verify()
+
+        with Image.open(ruta) as img:
+            img.load()
+    except Exception as exc:
+        raise ImagenInvalida(f"{type(exc).__name__}: {exc}") from exc
+
+    if not formato:
+        raise ImagenInvalida("Formato de imagen no identificado.")
+
+    return {"formato": formato, "ancho": ancho, "alto": alto}
+
+
+def generar_miniatura(origen: Path, destino: Path, max_lado):
+    """
+    Miniatura local: conserva proporción y formato, sin recortar ni ampliar
+    (lado máximo max_lado). Respeta la orientación EXIF solo en la miniatura.
+    Devuelve (ancho, alto).
+    """
+    _exigir_pillow()
+
+    try:
+        with Image.open(origen) as img:
+            formato = img.format
+            img.load()
+            miniatura = ImageOps.exif_transpose(img)
+            miniatura.thumbnail((max_lado, max_lado), Image.Resampling.LANCZOS)
+
+            opciones = {}
+            if formato == "JPEG":
+                opciones = {"quality": 85, "optimize": True}
+            elif formato == "PNG":
+                opciones = {"optimize": True}
+
+            miniatura.save(destino, format=formato, **opciones)
+            return miniatura.size
+    except Exception as exc:
+        raise ImagenInvalida(f"Miniatura: {type(exc).__name__}: {exc}") from exc
+
+
+def miniatura_valida(ruta: Path, max_lado):
+    """Info de la miniatura si existe, se decodifica y respeta max_lado; si no, None."""
+    if not ruta.is_file():
+        return None
+
+    try:
+        info = inspeccionar_imagen(ruta)
+    except ImagenInvalida:
+        return None
+
+    return info if max(info["ancho"], info["alto"]) <= max_lado else None
+
+
+def descargar_imagen(
+    url,
+    ruta_part: Path,
+    abrir,
+    limitador,
+    *,
+    timeout,
+    reintentos,
+    dormir=time.sleep,
+    imprimir=print,
+    parar_ante_bloqueo=False,
+    max_bytes=MAX_BYTES_IMAGEN,
+):
+    """
+    Descarga url a ruta_part (en streaming) y valida lo básico: HTTP 200,
+    Content-Type de imagen, cuerpo completo y no vacío. La validación con
+    Pillow y el paso a nombre definitivo los hace el llamador.
+
+    Devuelve un dict con estado (OK/HTTP_ERROR/CONTENT_TYPE_INVALIDO/VACIA/
+    IMAGEN_CORRUPTA/ERROR_RED), http_status, intentos, content_type, bytes,
+    cabeceras, error y bloqueo (se vio una señal de rate limiting o bloqueo).
+    """
+    peticion = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": IMAGEN_ACCEPT,
+            "Accept-Encoding": "identity",
+        },
+    )
+    resultado = {"url": url, "intentos": 0}
+
+    def leer(respuesta):
+        headers = respuesta.headers
+        content_type = headers.get("Content-Type", "") if headers else ""
+        resultado.update(
+            http_status=respuesta.status,
+            content_type=content_type,
+            cabeceras=cabeceras_a_dict(headers),
+        )
+
+        if respuesta.status != 200:
+            resultado.update(
+                estado=EST_IMG_HTTP_ERROR,
+                error=f"HTTP {respuesta.status} inesperado.",
+            )
+            return
+
+        if not content_type_es_imagen(content_type):
+            muestra = respuesta.read(4096)
+            resultado.update(
+                bytes=len(muestra),
+                muestra=muestra_cuerpo(muestra),
+                estado=EST_IMG_CONTENT_TYPE_INVALIDO,
+                error=f"Content-Type no es de imagen: {content_type!r}",
+            )
+            if detectar_bloqueo(respuesta.status, headers, muestra):
+                resultado["bloqueo"] = True
+            return
+
+        try:
+            destino = ruta_part.open("wb")
+        except OSError as exc:
+            raise ErrorEscrituraLocal(f"No se puede escribir {ruta_part}: {exc}") from exc
+
+        total = 0
+        with destino:
+            while True:
+                bloque = respuesta.read(TAMANO_BLOQUE)
+
+                if not bloque:
+                    break
+
+                total += len(bloque)
+
+                if total > max_bytes:
+                    resultado.update(
+                        bytes=total,
+                        estado=EST_IMG_CORRUPTA,
+                        error=f"Supera el tamaño máximo permitido ({max_bytes} bytes).",
+                    )
+                    return
+
+                try:
+                    destino.write(bloque)
+                except OSError as exc:
+                    raise ErrorEscrituraLocal(f"No se puede escribir {ruta_part}: {exc}") from exc
+
+        resultado["bytes"] = total
+        declarado = headers.get("Content-Length") if headers else None
+
+        if declarado and declarado.strip().isdigit() and int(declarado) != total:
+            raise http.client.IncompleteRead(b"", max(int(declarado) - total, 0))
+
+        if total == 0:
+            resultado.update(estado=EST_IMG_VACIA, error="La respuesta no tiene contenido.")
+            return
+
+        resultado["estado"] = EST_IMG_OK
+
+    return ejecutar_peticion(
+        peticion,
+        abrir,
+        limitador,
+        resultado,
+        leer,
+        timeout=timeout,
+        reintentos=reintentos,
+        dormir=dormir,
+        imprimir=imprimir,
+        estado_http=lambda status: EST_IMG_HTTP_ERROR,
+        estado_red=EST_IMG_ERROR_RED,
+        estado_recuperable=EST_IMG_HTTP_ERROR,
+        parar_ante_bloqueo=parar_ante_bloqueo,
+    )
+
+
+def procesar_imagen(
+    fichero,
+    imagenes_dir: Path,
+    abrir,
+    limitador,
+    *,
+    thumb_max,
+    timeout,
+    reintentos,
+    parar_ante_bloqueo=False,
+    dormir=time.sleep,
+    imprimir=print,
+):
+    """
+    Deja una imagen completa y su miniatura en imagenes_dir/full y /thumb.
+
+    Reanudación: original válido y miniatura válida -> se reutilizan; original
+    válido sin miniatura válida -> solo se regenera la miniatura; original
+    ausente o corrupto -> se vuelve a descargar. Todo se escribe en .part y
+    solo pasa al nombre definitivo tras validarse.
+    """
+    nombre = nombre_local_seguro(fichero)
+    ruta_full = imagenes_dir / "full" / nombre
+    ruta_thumb = imagenes_dir / "thumb" / nombre
+    part_full = ruta_full.with_name(nombre + ".part")
+    part_thumb = ruta_thumb.with_name(nombre + ".part")
+
+    r = {
+        "url": construir_url_imagen(fichero),
+        "nombre_local": nombre,
+        "estado": None,
+        "accion": "",
+        "http_status": "",
+        "intentos": 0,
+        "content_type": "",
+        "bytes": "",
+        "formato": "",
+        "ancho": "",
+        "alto": "",
+        "miniatura_ancho": "",
+        "miniatura_alto": "",
+        "cabeceras": {},
+        "error": "",
+        "bloqueo": False,
+    }
+
+    def anotar_imagen(info):
+        r.update(formato=info["formato"], ancho=info["ancho"], alto=info["alto"])
+
+    existente = None
+    if ruta_full.is_file():
+        try:
+            existente = inspeccionar_imagen(ruta_full)
+        except ImagenInvalida:
+            existente = None
+
+    if existente is not None:
+        anotar_imagen(existente)
+        r["bytes"] = ruta_full.stat().st_size
+        mini = miniatura_valida(ruta_thumb, thumb_max)
+
+        if mini is not None:
+            r.update(
+                estado=EST_IMG_OK,
+                accion=ACCION_REUTILIZADA,
+                miniatura_ancho=mini["ancho"],
+                miniatura_alto=mini["alto"],
+            )
+            return r
+
+        r["accion"] = ACCION_SOLO_MINIATURA
+        try:
+            ancho, alto = generar_miniatura(ruta_full, part_thumb, thumb_max)
+            os.replace(part_thumb, ruta_thumb)
+            r.update(estado=EST_IMG_OK, miniatura_ancho=ancho, miniatura_alto=alto)
+        except ImagenInvalida as exc:
+            r.update(estado=EST_IMG_CORRUPTA, error=str(exc))
+        finally:
+            part_thumb.unlink(missing_ok=True)
+
+        return r
+
+    ruta_full.unlink(missing_ok=True)
+    ruta_thumb.unlink(missing_ok=True)
+    r["accion"] = ACCION_DESCARGA
+
+    descarga = descargar_imagen(
+        r["url"],
+        part_full,
+        abrir,
+        limitador,
+        timeout=timeout,
+        reintentos=reintentos,
+        dormir=dormir,
+        imprimir=imprimir,
+        parar_ante_bloqueo=parar_ante_bloqueo,
+    )
+    r.update(
+        estado=descarga["estado"],
+        http_status=descarga.get("http_status", ""),
+        intentos=descarga["intentos"],
+        content_type=descarga.get("content_type", ""),
+        bytes=descarga.get("bytes", ""),
+        cabeceras=descarga.get("cabeceras", {}),
+        error=" | ".join(
+            t for t in (descarga.get("error", ""), descarga.get("muestra", "")) if t
+        ),
+        bloqueo=descarga.get("bloqueo", False),
+    )
+
+    try:
+        if r["estado"] == EST_IMG_OK:
+            try:
+                anotar_imagen(inspeccionar_imagen(part_full))
+                ancho, alto = generar_miniatura(part_full, part_thumb, thumb_max)
+            except ImagenInvalida as exc:
+                r.update(estado=EST_IMG_CORRUPTA, error=str(exc))
+            else:
+                os.replace(part_full, ruta_full)
+                os.replace(part_thumb, ruta_thumb)
+                r.update(miniatura_ancho=ancho, miniatura_alto=alto)
+    finally:
+        part_full.unlink(missing_ok=True)
+        part_thumb.unlink(missing_ok=True)
+
+    return r
+
+
+def preparar_directorio_imagenes(imagenes_dir: Path, resume):
+    """Crea full/ y thumb/. Sin resume descarta los de una ejecución anterior."""
+    for subdirectorio in ("full", "thumb"):
+        ruta = imagenes_dir / subdirectorio
+
+        if not resume and ruta.exists():
+            shutil.rmtree(ruta)
+
+        ruta.mkdir(parents=True, exist_ok=True)
+
+
+def procesar_imagenes(
+    filas_imagenes,
+    imagenes_dir: Path,
+    log_path: Path,
+    abrir,
+    limitador,
+    *,
+    thumb_max,
+    timeout,
+    reintentos,
+    maxim_imagenes=None,
+    parar_ante_bloqueo=False,
+    max_errores_consecutivos=0,
+    dormir=time.sleep,
+    imprimir=print,
+):
+    """
+    Descarga cada imagen física UNA sola vez (deduplicada por fichero) aunque
+    la compartan varios Gis_ID. Secuencial. Escribe log_imatges.csv (una fila
+    por fichero único). Devuelve {"por_fichero", "resumen"}, donde por_fichero
+    da RUTA_IMAGEN, RUTA_MINIATURA y ESTADO_DESCARGA de cada fichero.
+    """
+    unicas = OrderedDict()
+    relaciones = OrderedDict()
+
+    for fila in filas_imagenes:
+        fichero = fila["NOMBRE_FICHERO_ORIGEN"]
+        unicas.setdefault(fichero, fila["ID_IMAGEN_ORIGEN"])
+        relaciones[fichero] = relaciones.get(fichero, 0) + 1
+
+    seleccion = list(unicas)[:maxim_imagenes] if maxim_imagenes is not None else list(unicas)
+    seleccionadas = set(seleccion)
+
+    por_fichero = {}
+    estados = Counter()
+    acciones = Counter()
+    intentos_http = 0
+    bytes_descargados = 0
+    senales_bloqueo = 0
+    errores_consecutivos = 0
+    detenido_bloqueo = False
+    detenido_errores = False
+
+    def escribir(writer, f_log, fichero, r, estado=None, motivo=""):
+        writer.writerow({
+            "MOMENTO": datetime.now().isoformat(timespec="seconds"),
+            "ID_IMAGEN_ORIGEN": unicas[fichero],
+            "NOMBRE_FICHERO": fichero,
+            "NOMBRE_LOCAL": r["nombre_local"] if r else nombre_local_seguro(fichero),
+            "URL_ORIGEN": construir_url_imagen(fichero),
+            "ESTADO": estado or r["estado"],
+            "ACCION": r["accion"] if r else "",
+            "HTTP_STATUS": r["http_status"] if r else "",
+            "INTENTOS": r["intentos"] if r else 0,
+            "CONTENT_TYPE": r["content_type"] if r else "",
+            "BYTES": r["bytes"] if r else "",
+            "FORMATO": r["formato"] if r else "",
+            "ANCHO": r["ancho"] if r else "",
+            "ALTO": r["alto"] if r else "",
+            "MINIATURA_ANCHO": r["miniatura_ancho"] if r else "",
+            "MINIATURA_ALTO": r["miniatura_alto"] if r else "",
+            "CABECERAS": json.dumps(r["cabeceras"], ensure_ascii=False) if r else "",
+            "ERROR": r["error"] if r else motivo,
+        })
+        f_log.flush()
+
+    with log_path.open("w", encoding="utf-8-sig", newline="") as f_log:
+        writer = csv.DictWriter(f_log, fieldnames=CAMPOS_LOG_IMAGENES, delimiter=";")
+        writer.writeheader()
+        f_log.flush()
+
+        tratadas = set()
+
+        for posicion, fichero in enumerate(seleccion, start=1):
+            r = procesar_imagen(
+                fichero,
+                imagenes_dir,
+                abrir,
+                limitador,
+                thumb_max=thumb_max,
+                timeout=timeout,
+                reintentos=reintentos,
+                parar_ante_bloqueo=parar_ante_bloqueo,
+                dormir=dormir,
+                imprimir=imprimir,
+            )
+            tratadas.add(fichero)
+            escribir(writer, f_log, fichero, r)
+
+            estados[r["estado"]] += 1
+            acciones[r["accion"]] += 1
+            intentos_http += r["intentos"]
+            if r["accion"] == ACCION_DESCARGA and r["estado"] == EST_IMG_OK:
+                bytes_descargados += r["bytes"]
+            if r["bloqueo"]:
+                senales_bloqueo += 1
+
+            correcta = r["estado"] == EST_IMG_OK
+            por_fichero[fichero] = {
+                "RUTA_IMAGEN": f"full/{r['nombre_local']}" if correcta else "",
+                "RUTA_MINIATURA": f"thumb/{r['nombre_local']}" if correcta else "",
+                "ESTADO_DESCARGA": r["estado"],
+            }
+            imprimir(
+                f"[{posicion}/{len(seleccion)}] {fichero}: {r['estado']}"
+                + (f" ({r['accion']})" if r["accion"] else "")
+            )
+
+            errores_consecutivos = 0 if correcta else errores_consecutivos + 1
+
+            if r["bloqueo"] and parar_ante_bloqueo:
+                detenido_bloqueo = True
+                imprimir(
+                    "Señal de rate limiting o bloqueo detectada: se detiene la "
+                    "descarga de imágenes. Se conservan los resultados obtenidos."
+                )
+                break
+
+            if max_errores_consecutivos > 0 and errores_consecutivos >= max_errores_consecutivos:
+                detenido_errores = True
+                imprimir(
+                    f"Detenido: {errores_consecutivos} imágenes seguidas con error."
+                )
+                break
+
+        for fichero in unicas:
+            if fichero in tratadas:
+                continue
+
+            motivo = (
+                "Fuera de la selección (--maxim-imatges)."
+                if fichero not in seleccionadas
+                else "No intentada: la descarga se detuvo antes."
+            )
+            por_fichero[fichero] = {
+                "RUTA_IMAGEN": "",
+                "RUTA_MINIATURA": "",
+                "ESTADO_DESCARGA": EST_IMG_PENDIENTE,
+            }
+            estados[EST_IMG_PENDIENTE] += 1
+            escribir(writer, f_log, fichero, None, estado=EST_IMG_PENDIENTE, motivo=motivo)
+
+    total_relaciones = sum(relaciones.values())
+
+    return {
+        "por_fichero": por_fichero,
+        "resumen": {
+            "relaciones_gis_id_imagen": total_relaciones,
+            "ficheros_unicos": len(unicas),
+            "descargas_evitadas_por_deduplicacion": total_relaciones - len(unicas),
+            "seleccionados": len(seleccion),
+            "estados": dict(sorted(estados.items())),
+            "acciones": dict(sorted(acciones.items())),
+            "intentos_http": intentos_http,
+            "bytes_descargados": bytes_descargados,
+            "senales_bloqueo": senales_bloqueo,
+            "detenido_por_bloqueo": detenido_bloqueo,
+            "detenido_por_errores": detenido_errores,
+            "miniatura_max": thumb_max,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # Programa principal
 # ---------------------------------------------------------------------------
 
@@ -1318,9 +1988,28 @@ def generar_salidas(
     entradas,
     estados_consulta=None,
     extra=None,
+    procesar_imagenes=None,
 ):
-    """Camino común a offline y online: cruce, CSV y resumen."""
+    """
+    Camino común a offline y online: cruce, CSV y resumen.
+
+    procesar_imagenes (opcional, Fase 3): callable(filas_imagenes) que descarga
+    cada fichero único y devuelve {"por_fichero", "resumen"}; añade
+    RUTA_IMAGEN, RUTA_MINIATURA y ESTADO_DESCARGA a cada relación.
+    """
     filas_control, filas_imagenes = cruzar(inventario, markers, estados_consulta)
+
+    campos_imagenes = CAMPOS_IMAGENES
+    resumen_descarga = {}
+
+    if procesar_imagenes is not None:
+        descarga = procesar_imagenes(filas_imagenes)
+
+        for fila in filas_imagenes:
+            fila.update(descarga["por_fichero"][fila["NOMBRE_FICHERO_ORIGEN"]])
+
+        campos_imagenes = CAMPOS_IMAGENES + CAMPOS_DESCARGA
+        resumen_descarga = {"descarga": descarga["resumen"]}
 
     resumen = construir_resumen(
         inventario,
@@ -1336,6 +2025,7 @@ def generar_salidas(
         "entradas": entradas,
         **resumen,
         **(extra or {}),
+        **resumen_descarga,
     }
 
     escribir_csv_atomico(
@@ -1345,7 +2035,7 @@ def generar_salidas(
     )
     escribir_csv_atomico(
         output_dir / "IMATGES_INFOANTENAS.csv",
-        CAMPOS_IMAGENES,
+        campos_imagenes,
         (formatear_fila_imagen(f) for f in filas_imagenes),
     )
     escribir_json_atomico(output_dir / f"resum_{modo}.json", resumen)
@@ -1386,6 +2076,7 @@ def ejecutar_online(
     gis_ids=None,
     maxim=None,
     max_errores_consecutivos=0,
+    descarga=None,
     dormir=time.sleep,
     imprimir=print,
 ):
@@ -1393,6 +2084,10 @@ def ejecutar_online(
     Modo online: consulta /v1/markers, guarda una respuesta por Gis_ID y sigue
     el mismo camino que el offline. Devuelve (resumen, consulta); resumen es
     None si la ejecución se detuvo por errores consecutivos.
+
+    descarga (opcional, Fase 3): dict con abrir, limitador, imagenes_dir,
+    thumb_max, reintentos, maxim_imagenes y parar_ante_bloqueo. Si se indica,
+    se descargan las imágenes y se generan las miniaturas.
     """
     inventario_completo, estadisticas_inventario = leer_inventario(inventario_path)
     inventario_sha256 = sha256_fichero(inventario_path)
@@ -1402,6 +2097,28 @@ def ejecutar_online(
         trabajo_dir, inventario_path, inventario_sha256, parametros, resume
     )
     markers_dir = trabajo_dir / "markers"
+
+    procesar = None
+    if descarga is not None:
+        _exigir_pillow()
+        preparar_directorio_imagenes(descarga["imagenes_dir"], resume)
+
+        def procesar(filas_imagenes):
+            return procesar_imagenes(
+                filas_imagenes,
+                descarga["imagenes_dir"],
+                trabajo_dir / "log_imatges.csv",
+                descarga["abrir"],
+                descarga["limitador"],
+                thumb_max=descarga["thumb_max"],
+                timeout=parametros["timeout"],
+                reintentos=descarga["reintentos"],
+                maxim_imagenes=descarga.get("maxim_imagenes"),
+                parar_ante_bloqueo=descarga.get("parar_ante_bloqueo", False),
+                max_errores_consecutivos=max_errores_consecutivos,
+                dormir=dormir,
+                imprimir=imprimir,
+            )
 
     consulta = consultar_pendientes(
         seleccion,
@@ -1448,6 +2165,7 @@ def ejecutar_online(
                 "inicio_ejecucion": run["inicio"],
             },
         },
+        procesar_imagenes=procesar,
     )
 
     return resumen, consulta
@@ -1501,7 +2219,50 @@ def main(argv=None):
         "--max-errores-consecutivos",
         type=int,
         default=0,
-        help="Solo online. Detiene tras N errores técnicos seguidos. 0 = desactivado.",
+        help=(
+            "Solo online. Detiene tras N errores técnicos seguidos (consultas o "
+            "descargas de imagen). 0 = desactivado."
+        ),
+    )
+    parser.add_argument(
+        "--descargar-imagenes",
+        action="store_true",
+        help="Solo online. Descarga las imágenes completas y genera miniaturas locales.",
+    )
+    parser.add_argument(
+        "--imatges-per-minut",
+        type=float,
+        default=DEFAULT_IMATGES_PER_MINUT,
+        help="Descargas de imagen por minuto, independiente de /markers. Por defecto: 5.",
+    )
+    parser.add_argument(
+        "--imatges-reintents",
+        type=int,
+        default=DEFAULT_IMATGES_REINTENTS,
+        help="Reintentos adicionales por imagen. Por defecto: 2.",
+    )
+    parser.add_argument(
+        "--miniatura-max",
+        type=int,
+        default=DEFAULT_MINIATURA_MAX,
+        help="Lado máximo de la miniatura en píxeles. Por defecto: 300.",
+    )
+    parser.add_argument(
+        "--maxim-imatges",
+        type=int,
+        help="Trata solo los primeros N ficheros de imagen únicos; el resto queda PENDIENTE.",
+    )
+    parser.add_argument(
+        "--imagenes-dir",
+        help="Directorio con full/ y thumb/. Por defecto: <output-dir>/imagenes.",
+    )
+    parser.add_argument(
+        "--parar-ante-bloqueo",
+        action="store_true",
+        help=(
+            "Detiene la descarga al primer HTTP 429/403 o desafío de Cloudflare, "
+            "sin reintentar ni seguir con otras imágenes."
+        ),
     )
     args = parser.parse_args(argv)
 
@@ -1510,18 +2271,34 @@ def main(argv=None):
         or args.maxim is not None
         or args.gis_ids
         or args.trabajo_dir
+        or args.descargar_imagenes
     )
     if args.modo == "offline" and solo_online:
-        parser.error("--resume, --maxim, --gis-id y --trabajo-dir requieren --modo online.")
+        parser.error(
+            "--resume, --maxim, --gis-id, --trabajo-dir y --descargar-imagenes "
+            "requieren --modo online."
+        )
 
-    if args.peticions_per_minut <= 0:
-        parser.error("--peticions-per-minut debe ser mayor que 0.")
+    if (
+        args.maxim_imatges is not None or args.imagenes_dir or args.parar_ante_bloqueo
+    ) and not args.descargar_imagenes:
+        parser.error(
+            "--maxim-imatges, --imagenes-dir y --parar-ante-bloqueo requieren "
+            "--descargar-imagenes."
+        )
+
+    if args.peticions_per_minut <= 0 or args.imatges_per_minut <= 0:
+        parser.error("--peticions-per-minut e --imatges-per-minut deben ser mayores que 0.")
     if args.timeout <= 0:
         parser.error("--timeout debe ser mayor que 0.")
-    if args.reintents < 0:
-        parser.error("--reintents no puede ser negativo.")
+    if args.reintents < 0 or args.imatges_reintents < 0:
+        parser.error("--reintents e --imatges-reintents no pueden ser negativos.")
     if args.maxim is not None and args.maxim <= 0:
         parser.error("--maxim debe ser mayor que 0.")
+    if args.maxim_imatges is not None and args.maxim_imatges <= 0:
+        parser.error("--maxim-imatges debe ser mayor que 0.")
+    if args.miniatura_max <= 0:
+        parser.error("--miniatura-max debe ser mayor que 0.")
     if args.max_errores_consecutivos < 0:
         parser.error("--max-errores-consecutivos no puede ser negativo.")
 
@@ -1548,7 +2325,30 @@ def main(argv=None):
             "maxim": args.maxim,
             "gis_ids": args.gis_ids,
             "max_errores_consecutivos": args.max_errores_consecutivos,
+            "descargar_imagenes": args.descargar_imagenes,
         }
+        abrir = crear_apertura()
+        descarga = None
+
+        if args.descargar_imagenes:
+            imagenes_dir = Path(args.imagenes_dir) if args.imagenes_dir else output_dir / "imagenes"
+            descarga = {
+                "abrir": abrir,
+                "limitador": Limitador(60.0 / args.imatges_per_minut),
+                "imagenes_dir": imagenes_dir,
+                "thumb_max": args.miniatura_max,
+                "reintentos": args.imatges_reintents,
+                "maxim_imagenes": args.maxim_imatges,
+                "parar_ante_bloqueo": args.parar_ante_bloqueo,
+            }
+            parametros.update(
+                imatges_per_minut=args.imatges_per_minut,
+                imatges_reintentos=args.imatges_reintents,
+                miniatura_max=args.miniatura_max,
+                maxim_imatges=args.maxim_imatges,
+                parar_ante_bloqueo=args.parar_ante_bloqueo,
+            )
+            print(f"Imágenes: {args.imatges_per_minut:g} descargas/minuto -> {imagenes_dir}")
 
         print(f"Ritmo: {args.peticions_per_minut:g} peticiones/minuto")
         print(f"Trabajo: {trabajo_dir}")
@@ -1557,13 +2357,14 @@ def main(argv=None):
             inventario_path,
             output_dir,
             trabajo_dir,
-            abrir=crear_apertura(),
+            abrir=abrir,
             limitador=Limitador(60.0 / args.peticions_per_minut),
             parametros=parametros,
             resume=args.resume,
             gis_ids=args.gis_ids,
             maxim=args.maxim,
             max_errores_consecutivos=args.max_errores_consecutivos,
+            descarga=descarga,
         )
 
         if resumen is None:
@@ -1571,6 +2372,17 @@ def main(argv=None):
 
         hay_errores = any(e in ESTADOS_ERROR_TECNICO for e in consulta["estados"].values())
         codigo_salida = 2 if hay_errores else 0
+
+        resumen_descarga = resumen.get("descarga")
+        if resumen_descarga:
+            estados_imagen = resumen_descarga["estados"]
+
+            if any(e not in (EST_IMG_OK, EST_IMG_PENDIENTE) for e in estados_imagen):
+                codigo_salida = 2
+            if resumen_descarga["detenido_por_errores"]:
+                codigo_salida = 3
+            if resumen_descarga["detenido_por_bloqueo"]:
+                codigo_salida = 4
 
     print(json.dumps(
         {k: v for k, v in resumen.items() if k != "entradas"},

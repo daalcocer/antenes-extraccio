@@ -10,6 +10,8 @@ import unittest
 import urllib.error
 from pathlib import Path
 
+from PIL import Image
+
 import extraer_imagenes_infoantenas as m
 
 # Respuesta real (reducida) de /v1/markers?id=0000758 tomada de markers_raw.jsonl.
@@ -326,13 +328,16 @@ def cabeceras(**valores):
 
 
 class RespuestaFalsa:
-    def __init__(self, cuerpo, status=200, content_type="application/json; charset=utf-8"):
-        self._cuerpo = cuerpo
+    def __init__(self, cuerpo, status=200, content_type="application/json; charset=utf-8",
+                 content_length=None):
+        self._flujo = io.BytesIO(cuerpo)
         self.status = status
         self.headers = cabeceras(Content_Type=content_type)
+        if content_length is not None:
+            self.headers["Content-Length"] = str(content_length)
 
-    def read(self):
-        return self._cuerpo
+    def read(self, n=-1):
+        return self._flujo.read(n)
 
     def __enter__(self):
         return self
@@ -861,10 +866,620 @@ class TestOnlineIntegracion(unittest.TestCase):
 
 class TestCli(unittest.TestCase):
     def test_opciones_online_requieren_modo_online(self):
-        for opcion in (["--resume"], ["--maxim", "3"], ["--gis-id", "1"]):
+        for opcion in (["--resume"], ["--maxim", "3"], ["--gis-id", "1"], ["--descargar-imagenes"]):
             with self.subTest(opcion), contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit):
                     m.main(opcion)
+
+    def test_opciones_de_imagen_requieren_descargar_imagenes(self):
+        for opcion in (["--maxim-imatges", "3"], ["--parar-ante-bloqueo"], ["--imagenes-dir", "x"]):
+            with self.subTest(opcion), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    m.main(["--modo", "online"] + opcion)
+
+
+# ---------------------------------------------------------------------------
+# Fase 3: descarga de imágenes y miniaturas (sin red; imágenes sintéticas)
+# ---------------------------------------------------------------------------
+
+def imagen_bytes(formato="JPEG", tamano=(400, 200), color=(200, 30, 30)):
+    flujo = io.BytesIO()
+    Image.new("RGB", tamano, color).save(flujo, format=formato)
+    return flujo.getvalue()
+
+
+def respuesta_imagen(formato="JPEG", tamano=(400, 200), **kwargs):
+    tipo = {"JPEG": "image/jpeg", "PNG": "image/png"}[formato]
+    return RespuestaFalsa(imagen_bytes(formato, tamano), content_type=tipo, **kwargs)
+
+
+class RespuestaTruncada(RespuestaFalsa):
+    """Entrega unos bytes y luego falla, como una conexión cortada."""
+
+    def __init__(self):
+        super().__init__(imagen_bytes(), content_type="image/jpeg")
+        self._entregado = False
+
+    def read(self, n=-1):
+        if self._entregado:
+            raise ConnectionResetError("conexión cortada")
+        self._entregado = True
+        return super().read(50)
+
+
+def sin_partes(directorio):
+    return list(Path(directorio).rglob("*.part"))
+
+
+class ImagenesBase(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        self.imagenes = self.tmp / "imagenes"
+        m.preparar_directorio_imagenes(self.imagenes, resume=True)
+        self.pausas = []
+
+    def procesar(self, abridor, fichero="foto.jpg", reintentos=2, thumb_max=300, **kwargs):
+        return m.procesar_imagen(
+            fichero, self.imagenes, abridor, m.Limitador(0.0),
+            thumb_max=thumb_max, timeout=5, reintentos=reintentos,
+            dormir=self.pausas.append, imprimir=lambda *_: None, **kwargs,
+        )
+
+    def existe_full(self, nombre="foto.jpg"):
+        return (self.imagenes / "full" / nombre).exists()
+
+    def existe_thumb(self, nombre="foto.jpg"):
+        return (self.imagenes / "thumb" / nombre).exists()
+
+
+class TestDescargaImagen(ImagenesBase):
+    def test_jpg_valido(self):
+        r = self.procesar(Abridor(respuesta_imagen("JPEG", (400, 200))), "foto.jpg")
+
+        self.assertEqual(r["estado"], m.EST_IMG_OK)
+        self.assertEqual((r["formato"], r["ancho"], r["alto"]), ("JPEG", 400, 200))
+        self.assertEqual((r["miniatura_ancho"], r["miniatura_alto"]), (300, 150))
+        self.assertTrue(self.existe_full() and self.existe_thumb())
+        self.assertEqual(sin_partes(self.tmp), [])
+
+    def test_jpeg_valido(self):
+        r = self.procesar(Abridor(respuesta_imagen("JPEG")), "foto.jpeg")
+
+        self.assertEqual(r["estado"], m.EST_IMG_OK)
+        self.assertTrue(self.existe_full("foto.jpeg") and self.existe_thumb("foto.jpeg"))
+
+    def test_png_valido_conserva_formato_en_la_miniatura(self):
+        r = self.procesar(Abridor(respuesta_imagen("PNG", (600, 300))), "foto.png")
+
+        self.assertEqual(r["estado"], m.EST_IMG_OK)
+        self.assertEqual(r["formato"], "PNG")
+        with Image.open(self.imagenes / "thumb" / "foto.png") as miniatura:
+            self.assertEqual(miniatura.format, "PNG")
+            self.assertEqual(miniatura.size, (300, 150))
+
+    def test_el_formato_real_manda_sobre_la_extension(self):
+        r = self.procesar(Abridor(respuesta_imagen("PNG")), "engañosa.jpg")
+
+        self.assertEqual(r["estado"], m.EST_IMG_OK)
+        self.assertEqual(r["formato"], "PNG")
+
+    def test_http_200_con_html(self):
+        html = RespuestaFalsa(b"<html>Error</html>", content_type="text/html; charset=UTF-8")
+        r = self.procesar(Abridor(html))
+
+        self.assertEqual(r["estado"], m.EST_IMG_CONTENT_TYPE_INVALIDO)
+        self.assertEqual(r["intentos"], 1)
+        self.assertFalse(self.existe_full() or self.existe_thumb())
+        self.assertEqual(sin_partes(self.tmp), [])
+
+    def test_content_type_invalido_aunque_el_cuerpo_sea_imagen(self):
+        r = self.procesar(Abridor(RespuestaFalsa(imagen_bytes(), content_type="application/json")))
+
+        self.assertEqual(r["estado"], m.EST_IMG_CONTENT_TYPE_INVALIDO)
+        self.assertFalse(self.existe_full())
+
+    def test_desafio_de_cloudflare_se_marca_como_bloqueo(self):
+        pagina = RespuestaFalsa(b"<title>Just a moment...</title>", content_type="text/html")
+        r = self.procesar(Abridor(pagina))
+
+        self.assertEqual(r["estado"], m.EST_IMG_CONTENT_TYPE_INVALIDO)
+        self.assertTrue(r["bloqueo"])
+
+    def test_imagen_vacia(self):
+        r = self.procesar(Abridor(RespuestaFalsa(b"", content_type="image/jpeg")))
+
+        self.assertEqual(r["estado"], m.EST_IMG_VACIA)
+        self.assertFalse(self.existe_full())
+        self.assertEqual(sin_partes(self.tmp), [])
+
+    def test_imagen_corrupta(self):
+        r = self.procesar(Abridor(RespuestaFalsa(b"no soy una imagen", content_type="image/jpeg")))
+
+        self.assertEqual(r["estado"], m.EST_IMG_CORRUPTA)
+        self.assertFalse(self.existe_full() or self.existe_thumb())
+        self.assertEqual(sin_partes(self.tmp), [])
+
+    def test_imagen_truncada_se_detecta_al_decodificar(self):
+        mitad = imagen_bytes("JPEG", (800, 600))[:400]
+        r = self.procesar(Abridor(RespuestaFalsa(mitad, content_type="image/jpeg")))
+
+        self.assertEqual(r["estado"], m.EST_IMG_CORRUPTA)
+        self.assertFalse(self.existe_full())
+
+    def test_429_con_retry_after(self):
+        abridor = Abridor(http_error(429, Retry_After="7"), respuesta_imagen())
+        r = self.procesar(abridor)
+
+        self.assertEqual(r["estado"], m.EST_IMG_OK)
+        self.assertEqual(r["intentos"], 2)
+        self.assertEqual(self.pausas, [7.0])
+
+    def test_429_con_retry_after_excesivo_no_se_espera(self):
+        r = self.procesar(Abridor(http_error(429, Retry_After="3600"), respuesta_imagen()))
+
+        self.assertEqual(r["estado"], m.EST_IMG_HTTP_ERROR)
+        self.assertTrue(r["bloqueo"])
+        self.assertEqual(r["intentos"], 1)
+        self.assertEqual(self.pausas, [])
+
+    def test_429_parar_ante_bloqueo_no_reintenta(self):
+        abridor = Abridor(http_error(429, Retry_After="7"), respuesta_imagen())
+        r = self.procesar(abridor, parar_ante_bloqueo=True)
+
+        self.assertEqual(r["estado"], m.EST_IMG_HTTP_ERROR)
+        self.assertTrue(r["bloqueo"])
+        self.assertEqual(len(abridor.peticiones), 1)
+        self.assertEqual(self.pausas, [])
+
+    def test_403_es_bloqueo_y_no_se_reintenta(self):
+        abridor = Abridor(http_error(403, b"<html>Forbidden</html>"), respuesta_imagen())
+        r = self.procesar(abridor)
+
+        self.assertEqual(r["estado"], m.EST_IMG_HTTP_ERROR)
+        self.assertTrue(r["bloqueo"])
+        self.assertEqual(len(abridor.peticiones), 1)
+
+    def test_404_se_registra_sin_reintentar_ni_bloqueo(self):
+        abridor = Abridor(http_error(404))
+        r = self.procesar(abridor)
+
+        self.assertEqual(r["estado"], m.EST_IMG_HTTP_ERROR)
+        self.assertEqual(r["http_status"], 404)
+        self.assertFalse(r["bloqueo"])
+        self.assertEqual(len(abridor.peticiones), 1)
+
+    def test_5xx_con_reintento(self):
+        r = self.procesar(Abridor(http_error(503), respuesta_imagen()))
+
+        self.assertEqual(r["estado"], m.EST_IMG_OK)
+        self.assertEqual(r["intentos"], 2)
+        self.assertEqual(self.pausas, [10])
+
+    def test_5xx_agotado(self):
+        r = self.procesar(Abridor(por_defecto=http_error(500)), reintentos=1)
+
+        self.assertEqual(r["estado"], m.EST_IMG_HTTP_ERROR)
+        self.assertEqual(r["intentos"], 2)
+        self.assertFalse(self.existe_full())
+
+    def test_error_de_red_con_reintento(self):
+        r = self.procesar(Abridor(urllib.error.URLError("sin red"), respuesta_imagen()))
+
+        self.assertEqual(r["estado"], m.EST_IMG_OK)
+        self.assertEqual(r["intentos"], 2)
+
+    def test_error_de_red_agotado(self):
+        r = self.procesar(Abridor(por_defecto=urllib.error.URLError("sin red")), reintentos=1)
+
+        self.assertEqual(r["estado"], m.EST_IMG_ERROR_RED)
+        self.assertEqual(r["intentos"], 2)
+
+    def test_descarga_incompleta_segun_content_length(self):
+        cuerpo = imagen_bytes()
+        corta = RespuestaFalsa(cuerpo[:100], content_type="image/jpeg", content_length=len(cuerpo))
+        r = self.procesar(Abridor(corta, respuesta_imagen()))
+
+        self.assertEqual(r["estado"], m.EST_IMG_OK)
+        self.assertEqual(r["intentos"], 2)
+
+    def test_part_se_elimina_si_la_conexion_se_corta(self):
+        r = self.procesar(Abridor(RespuestaTruncada()), reintentos=0)
+
+        self.assertEqual(r["estado"], m.EST_IMG_ERROR_RED)
+        self.assertEqual(sin_partes(self.tmp), [])
+        self.assertFalse(self.existe_full())
+
+    def test_definitivo_solo_tras_descarga_valida(self):
+        class Comprobador(Abridor):
+            def __call__(self, peticion, timeout):
+                respuesta = super().__call__(peticion, timeout)
+                test.assertFalse(test.existe_full())
+                return respuesta
+
+        test = self
+        self.procesar(Comprobador(respuesta_imagen()))
+        self.assertTrue(self.existe_full())
+
+    def test_registra_cabeceras_utiles_sin_cookies(self):
+        respuesta = respuesta_imagen(content_length=None)
+        respuesta.headers["ETag"] = '"abc"'
+        respuesta.headers["Last-Modified"] = "Wed, 01 Jan 2025 00:00:00 GMT"
+        respuesta.headers["Set-Cookie"] = "ci_session=secreto"
+        r = self.procesar(Abridor(respuesta))
+
+        self.assertEqual(r["cabeceras"]["etag"], '"abc"')
+        self.assertIn("last-modified", r["cabeceras"])
+        self.assertNotIn("set-cookie", r["cabeceras"])
+        self.assertEqual(r["content_type"], "image/jpeg")
+
+    def test_la_peticion_pide_la_url_de_imagen_completa(self):
+        abridor = Abridor(respuesta_imagen())
+        self.procesar(abridor, "1729885461_x.jpg")
+
+        self.assertEqual(
+            abridor.peticiones[0].full_url,
+            "https://antenasmoviles.es/archive/antenas/1729885461_x.jpg",
+        )
+
+
+class TestMiniaturas(ImagenesBase):
+    def miniatura(self, formato, tamano, max_lado=300):
+        origen = self.tmp / "origen.img"
+        origen.write_bytes(imagen_bytes(formato, tamano))
+        destino = self.tmp / "mini.img"
+        return m.generar_miniatura(origen, destino, max_lado), destino
+
+    def test_mantiene_proporcion_horizontal(self):
+        (ancho, alto), _ = self.miniatura("JPEG", (1000, 400))
+        self.assertEqual((ancho, alto), (300, 120))
+
+    def test_mantiene_proporcion_vertical(self):
+        (ancho, alto), _ = self.miniatura("PNG", (200, 800))
+        self.assertEqual((ancho, alto), (75, 300))
+
+    def test_no_amplia_imagenes_pequenas(self):
+        (ancho, alto), _ = self.miniatura("JPEG", (100, 50))
+        self.assertEqual((ancho, alto), (100, 50))
+
+    def test_maximo_configurable(self):
+        (ancho, alto), destino = self.miniatura("JPEG", (400, 200), max_lado=100)
+        self.assertEqual((ancho, alto), (100, 50))
+        with Image.open(destino) as imagen_final:
+            self.assertEqual(imagen_final.size, (100, 50))
+
+    def test_no_modifica_el_original(self):
+        origen = self.tmp / "origen.jpg"
+        contenido = imagen_bytes("JPEG", (400, 200))
+        origen.write_bytes(contenido)
+        m.generar_miniatura(origen, self.tmp / "mini.jpg", 100)
+
+        self.assertEqual(origen.read_bytes(), contenido)
+
+    def test_nombre_local_y_url(self):
+        self.assertEqual(m.nombre_local_seguro("1729885461_6fbc.jpg"), "1729885461_6fbc.jpg")
+
+        for raro in ("../x.jpg", "a/b.jpg", "..", "con espacio.jpg"):
+            with self.subTest(raro):
+                nombre = m.nombre_local_seguro(raro)
+                self.assertNotIn("/", nombre)
+                self.assertNotIn("\\", nombre)
+                self.assertNotIn(nombre, ("..", "."))
+
+        self.assertEqual(
+            m.construir_url_imagen("1729885461_6fbc.jpg"),
+            m.IMAGE_PREFIX + "1729885461_6fbc.jpg",
+        )
+
+    def test_deteccion_de_bloqueo(self):
+        self.assertTrue(m.detectar_bloqueo(429, None))
+        self.assertTrue(m.detectar_bloqueo(403, None))
+        self.assertTrue(m.detectar_bloqueo(503, cabeceras(CF_Mitigated="challenge")))
+        self.assertTrue(m.detectar_bloqueo(200, None, b"<html>Just a moment...</html>"))
+        self.assertFalse(m.detectar_bloqueo(404, None))
+        self.assertFalse(m.detectar_bloqueo(500, None))
+
+
+class TestReanudacionImagenes(ImagenesBase):
+    def test_reutiliza_original_y_miniatura_validos(self):
+        self.procesar(Abridor(respuesta_imagen()))
+
+        abridor = Abridor()
+        r = self.procesar(abridor)
+
+        self.assertEqual(abridor.peticiones, [])
+        self.assertEqual((r["estado"], r["accion"]), (m.EST_IMG_OK, m.ACCION_REUTILIZADA))
+        self.assertEqual(r["intentos"], 0)
+
+    def test_original_valido_y_miniatura_ausente_solo_genera_miniatura(self):
+        self.procesar(Abridor(respuesta_imagen()))
+        original = (self.imagenes / "full" / "foto.jpg").read_bytes()
+        (self.imagenes / "thumb" / "foto.jpg").unlink()
+
+        abridor = Abridor()
+        r = self.procesar(abridor)
+
+        self.assertEqual(abridor.peticiones, [])
+        self.assertEqual((r["estado"], r["accion"]), (m.EST_IMG_OK, m.ACCION_SOLO_MINIATURA))
+        self.assertTrue(self.existe_thumb())
+        self.assertEqual((self.imagenes / "full" / "foto.jpg").read_bytes(), original)
+
+    def test_miniatura_corrupta_se_regenera(self):
+        self.procesar(Abridor(respuesta_imagen()))
+        (self.imagenes / "thumb" / "foto.jpg").write_bytes(b"basura")
+
+        abridor = Abridor()
+        r = self.procesar(abridor)
+
+        self.assertEqual(abridor.peticiones, [])
+        self.assertEqual(r["accion"], m.ACCION_SOLO_MINIATURA)
+        self.assertIsNotNone(m.miniatura_valida(self.imagenes / "thumb" / "foto.jpg", 300))
+
+    def test_original_corrupto_se_vuelve_a_descargar(self):
+        self.procesar(Abridor(respuesta_imagen()))
+        (self.imagenes / "full" / "foto.jpg").write_bytes(b"corrupto")
+
+        abridor = Abridor(respuesta_imagen("JPEG", (800, 400)))
+        r = self.procesar(abridor)
+
+        self.assertEqual(len(abridor.peticiones), 1)
+        self.assertEqual((r["estado"], r["accion"]), (m.EST_IMG_OK, m.ACCION_DESCARGA))
+        self.assertEqual(r["ancho"], 800)
+
+    def test_original_corrupto_y_descarga_fallida_no_deja_ficheros(self):
+        self.procesar(Abridor(respuesta_imagen()))
+        (self.imagenes / "full" / "foto.jpg").write_bytes(b"corrupto")
+
+        r = self.procesar(Abridor(http_error(404)))
+
+        self.assertEqual(r["estado"], m.EST_IMG_HTTP_ERROR)
+        self.assertFalse(self.existe_full() or self.existe_thumb())
+
+
+class TestProcesarImagenes(ImagenesBase):
+    def filas(self, *relaciones):
+        """relaciones: (gis_id, id_imagen, fichero)."""
+        return [
+            {"GIS_ID": g, "ID_IMAGEN_ORIGEN": i, "NOMBRE_FICHERO_ORIGEN": f}
+            for g, i, f in relaciones
+        ]
+
+    def procesar_todas(self, filas, abridor, **kwargs):
+        return m.procesar_imagenes(
+            filas, self.imagenes, self.tmp / "log_imatges.csv", abridor, m.Limitador(0.0),
+            thumb_max=300, timeout=5, reintentos=0,
+            dormir=lambda s: None, imprimir=lambda *_: None, **kwargs,
+        )
+
+    def leer_log(self):
+        with (self.tmp / "log_imatges.csv").open(encoding="utf-8-sig", newline="") as f:
+            return list(csv.DictReader(f, delimiter=";"))
+
+    def test_imagen_compartida_se_descarga_una_sola_vez(self):
+        filas = self.filas(
+            ("0000758", "1", "compartida.jpg"),
+            ("000758", "1", "compartida.jpg"),
+            ("758", "1", "compartida.jpg"),
+            ("4300034", "2", "otra.jpg"),
+        )
+        abridor = Abridor(respuesta_imagen(), respuesta_imagen())
+        resultado = self.procesar_todas(filas, abridor)
+
+        self.assertEqual(len(abridor.peticiones), 2)
+        self.assertEqual(sorted(resultado["por_fichero"]), ["compartida.jpg", "otra.jpg"])
+        self.assertEqual(resultado["resumen"]["relaciones_gis_id_imagen"], 4)
+        self.assertEqual(resultado["resumen"]["ficheros_unicos"], 2)
+        self.assertEqual(resultado["resumen"]["descargas_evitadas_por_deduplicacion"], 2)
+
+    def test_log_una_fila_por_fichero_unico(self):
+        filas = self.filas(("a", "1", "x.jpg"), ("b", "1", "x.jpg"), ("c", "2", "y.jpg"))
+        self.procesar_todas(filas, Abridor(respuesta_imagen(), http_error(404)))
+        log = self.leer_log()
+
+        self.assertEqual([r["NOMBRE_FICHERO"] for r in log], ["x.jpg", "y.jpg"])
+        self.assertEqual([r["ESTADO"] for r in log], [m.EST_IMG_OK, m.EST_IMG_HTTP_ERROR])
+        self.assertEqual(log[0]["ID_IMAGEN_ORIGEN"], "1")
+        self.assertEqual(log[0]["HTTP_STATUS"], "200")
+        self.assertEqual(log[0]["CONTENT_TYPE"], "image/jpeg")
+        self.assertEqual(log[1]["HTTP_STATUS"], "404")
+        self.assertEqual(log[0]["URL_ORIGEN"], m.IMAGE_PREFIX + "x.jpg")
+        self.assertNotIn("cookie", log[0]["CABECERAS"].lower())
+
+    def test_un_error_no_aborta_el_resto(self):
+        filas = self.filas(("a", "1", "x.jpg"), ("b", "2", "y.jpg"), ("c", "3", "z.jpg"))
+        resultado = self.procesar_todas(
+            filas, Abridor(http_error(404), RespuestaFalsa(b"", content_type="image/jpeg"), respuesta_imagen())
+        )
+
+        estados = {f: v["ESTADO_DESCARGA"] for f, v in resultado["por_fichero"].items()}
+        self.assertEqual(
+            estados,
+            {"x.jpg": m.EST_IMG_HTTP_ERROR, "y.jpg": m.EST_IMG_VACIA, "z.jpg": m.EST_IMG_OK},
+        )
+        self.assertEqual(resultado["por_fichero"]["x.jpg"]["RUTA_IMAGEN"], "")
+        self.assertEqual(resultado["por_fichero"]["z.jpg"]["RUTA_IMAGEN"], "full/z.jpg")
+        self.assertEqual(resultado["por_fichero"]["z.jpg"]["RUTA_MINIATURA"], "thumb/z.jpg")
+
+    def test_maxim_imatges_deja_el_resto_pendiente(self):
+        filas = self.filas(("a", "1", "x.jpg"), ("b", "2", "y.jpg"), ("c", "3", "z.jpg"))
+        abridor = Abridor(respuesta_imagen(), respuesta_imagen())
+        resultado = self.procesar_todas(filas, abridor, maxim_imagenes=2)
+
+        self.assertEqual(len(abridor.peticiones), 2)
+        self.assertEqual(resultado["por_fichero"]["z.jpg"]["ESTADO_DESCARGA"], m.EST_IMG_PENDIENTE)
+        self.assertEqual(self.leer_log()[-1]["ESTADO"], m.EST_IMG_PENDIENTE)
+
+    def test_bloqueo_detiene_y_conserva_lo_descargado(self):
+        filas = self.filas(("a", "1", "x.jpg"), ("b", "2", "y.jpg"), ("c", "3", "z.jpg"))
+        abridor = Abridor(respuesta_imagen(), http_error(429), respuesta_imagen())
+        resultado = self.procesar_todas(filas, abridor, parar_ante_bloqueo=True)
+
+        self.assertEqual(len(abridor.peticiones), 2)
+        self.assertTrue(resultado["resumen"]["detenido_por_bloqueo"])
+        estados = [v["ESTADO_DESCARGA"] for v in resultado["por_fichero"].values()]
+        self.assertEqual(estados, [m.EST_IMG_OK, m.EST_IMG_HTTP_ERROR, m.EST_IMG_PENDIENTE])
+        self.assertTrue(self.existe_full("x.jpg"))
+
+    def test_errores_consecutivos_detienen(self):
+        filas = self.filas(*[("g", str(i), f"{i}.jpg") for i in range(4)])
+        abridor = Abridor(por_defecto=http_error(404))
+        resultado = self.procesar_todas(filas, abridor, max_errores_consecutivos=2)
+
+        self.assertEqual(len(abridor.peticiones), 2)
+        self.assertTrue(resultado["resumen"]["detenido_por_errores"])
+
+
+class TestOnlineConImagenes(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        self.out = self.tmp / "out"
+        self.inv = self.tmp / "inv.csv"
+        # Operador y coordenadas del inventario distintos de los del marker.
+        escribir_inventario(self.inv, [
+            ("0000758", "VODAFONE ESPAÑA, S.A.U.", 42.5, 3.0),
+            ("000758", "VODAFONE ESPAÑA, S.A.U.", 42.5, 3.0),
+            ("4300034", "ORANGE ESPAGNE, S.A.U.", 40.5, 0.4),
+        ])
+        self.params = {"timeout": 5, "reintentos": 0}
+        compartida = dict(imagen("173568", "compartida.jpg"), old="1")
+        self.respuestas = {
+            "0000758": [compartida, imagen("200", "propia.png")],
+            "000758": [compartida],
+            "4300034": [],
+        }
+
+    def marcadores(self):
+        return Abridor(*[
+            RespuestaFalsa(json_bytes(marker(c, "OP", 41.0, 2.0, imgs)))
+            for c, imgs in self.respuestas.items()
+        ])
+
+    def descarga(self, abridor, **kwargs):
+        return {
+            "abrir": abridor, "limitador": m.Limitador(0.0),
+            "imagenes_dir": self.out / "imagenes", "thumb_max": 300,
+            "reintentos": 0, **kwargs,
+        }
+
+    def online(self, abridor_markers, abridor_imagenes, resume=False, **kwargs):
+        return m.ejecutar_online(
+            self.inv, self.out, self.out / "_treball",
+            abrir=abridor_markers, limitador=m.Limitador(0.0), parametros=self.params,
+            resume=resume, descarga=self.descarga(abridor_imagenes, **kwargs),
+            dormir=lambda s: None, imprimir=lambda *_: None,
+        )
+
+    def leer_csv(self, nombre="IMATGES_INFOANTENAS.csv"):
+        with (self.out / nombre).open(encoding="utf-8-sig", newline="") as f:
+            return list(csv.DictReader(f, delimiter=";"))
+
+    def imagenes_ok(self):
+        return Abridor(respuesta_imagen("JPEG"), respuesta_imagen("PNG", (500, 500)))
+
+    def test_relaciones_apuntan_al_mismo_fichero_y_se_descarga_una_vez(self):
+        abridor_imagenes = self.imagenes_ok()
+        resumen, _ = self.online(self.marcadores(), abridor_imagenes)
+        filas = self.leer_csv()
+
+        self.assertEqual(len(filas), 3)
+        self.assertEqual(len(abridor_imagenes.peticiones), 2)
+        compartidas = [f for f in filas if f["NOMBRE_FICHERO_ORIGEN"] == "compartida.jpg"]
+        self.assertEqual({f["GIS_ID"] for f in compartidas}, {"0000758", "000758"})
+        self.assertEqual({f["RUTA_IMAGEN"] for f in compartidas}, {"full/compartida.jpg"})
+        self.assertEqual({f["RUTA_MINIATURA"] for f in compartidas}, {"thumb/compartida.jpg"})
+        self.assertEqual({f["ESTADO_DESCARGA"] for f in filas}, {m.EST_IMG_OK})
+        self.assertEqual(resumen["descarga"]["descargas_evitadas_por_deduplicacion"], 1)
+        self.assertEqual(resumen["imagenes"]["unicas_por_fichero"], 2)
+
+    def test_rutas_relativas_y_ficheros_existentes(self):
+        self.online(self.marcadores(), self.imagenes_ok())
+
+        for fila in self.leer_csv():
+            for campo in ("RUTA_IMAGEN", "RUTA_MINIATURA"):
+                self.assertFalse(Path(fila[campo]).is_absolute())
+                self.assertNotIn(":", fila[campo])
+                self.assertTrue((self.out / "imagenes" / fila[campo]).is_file())
+
+    def test_old_y_desmantelada_no_excluyen_y_se_conservan(self):
+        self.online(self.marcadores(), self.imagenes_ok())
+        compartida = [f for f in self.leer_csv() if f["NOMBRE_FICHERO_ORIGEN"] == "compartida.jpg"][0]
+
+        self.assertEqual(compartida["OLD"], "1")
+        self.assertEqual(compartida["ESTADO_DESCARGA"], m.EST_IMG_OK)
+        propia = [f for f in self.leer_csv() if f["NOMBRE_FICHERO_ORIGEN"] == "propia.png"][0]
+        self.assertEqual(propia["DESMANTELADA"], "1")
+        self.assertEqual(propia["ESTADO_DESCARGA"], m.EST_IMG_OK)
+
+    def test_distancia_alta_y_operador_distinto_no_impiden_la_descarga(self):
+        resumen, _ = self.online(self.marcadores(), self.imagenes_ok())
+        control = {f["GIS_ID"]: f for f in self.leer_csv("CONTROL_GIS_ID.csv")}
+
+        self.assertEqual(control["0000758"]["OPERADOR_COINCIDE"], "NO")
+        self.assertGreater(float(control["0000758"]["DISTANCIA_M"]), 100000)
+        self.assertEqual(resumen["descarga"]["estados"], {m.EST_IMG_OK: 2})
+
+    def test_log_imatges_en_el_directorio_de_trabajo(self):
+        self.online(self.marcadores(), self.imagenes_ok())
+        with (self.out / "_treball" / "log_imatges.csv").open(encoding="utf-8-sig", newline="") as f:
+            log = list(csv.DictReader(f, delimiter=";"))
+
+        self.assertEqual([r["NOMBRE_FICHERO"] for r in log], ["compartida.jpg", "propia.png"])
+        for campo in ("ID_IMAGEN_ORIGEN", "URL_ORIGEN", "ESTADO", "HTTP_STATUS",
+                      "INTENTOS", "CONTENT_TYPE", "BYTES", "ERROR"):
+            self.assertIn(campo, log[0])
+
+    def test_sin_descargar_el_csv_no_tiene_columnas_de_descarga(self):
+        m.ejecutar_online(
+            self.inv, self.out, self.out / "_treball",
+            abrir=self.marcadores(), limitador=m.Limitador(0.0), parametros=self.params,
+            dormir=lambda s: None, imprimir=lambda *_: None,
+        )
+        with (self.out / "IMATGES_INFOANTENAS.csv").open(encoding="utf-8-sig", newline="") as f:
+            self.assertEqual(next(csv.reader(f, delimiter=";")), m.CAMPOS_IMAGENES)
+        self.assertFalse((self.out / "imagenes").exists())
+
+    def test_resume_tras_interrupcion_solo_descarga_lo_pendiente(self):
+        with self.assertRaises(KeyboardInterrupt):
+            self.online(self.marcadores(), Abridor(respuesta_imagen(), KeyboardInterrupt()))
+
+        abridor_imagenes = Abridor(respuesta_imagen("PNG", (500, 500)))
+        resumen, _ = self.online(Abridor(), abridor_imagenes, resume=True)
+
+        self.assertEqual(len(abridor_imagenes.peticiones), 1)
+        self.assertEqual(resumen["descarga"]["acciones"],
+                         {m.ACCION_DESCARGA: 1, m.ACCION_REUTILIZADA: 1})
+        self.assertEqual({f["ESTADO_DESCARGA"] for f in self.leer_csv()}, {m.EST_IMG_OK})
+
+    def test_resume_regenera_solo_miniatura_ausente(self):
+        self.online(self.marcadores(), self.imagenes_ok())
+        (self.out / "imagenes" / "thumb" / "propia.png").unlink()
+
+        abridor_imagenes = Abridor()
+        resumen, _ = self.online(Abridor(), abridor_imagenes, resume=True)
+
+        self.assertEqual(abridor_imagenes.peticiones, [])
+        self.assertEqual(resumen["descarga"]["acciones"],
+                         {m.ACCION_REUTILIZADA: 1, m.ACCION_SOLO_MINIATURA: 1})
+
+    def test_nueva_ejecucion_vuelve_a_descargar_todo(self):
+        self.online(self.marcadores(), self.imagenes_ok())
+
+        abridor_imagenes = self.imagenes_ok()
+        self.online(self.marcadores(), abridor_imagenes)
+
+        self.assertEqual(len(abridor_imagenes.peticiones), 2)
+
+    def test_bloqueo_conserva_resultados_y_genera_csv(self):
+        abridor_imagenes = Abridor(respuesta_imagen(), http_error(429))
+        resumen, _ = self.online(self.marcadores(), abridor_imagenes, parar_ante_bloqueo=True)
+
+        self.assertTrue(resumen["descarga"]["detenido_por_bloqueo"])
+        estados = {f["NOMBRE_FICHERO_ORIGEN"]: f["ESTADO_DESCARGA"] for f in self.leer_csv()}
+        self.assertEqual(estados["compartida.jpg"], m.EST_IMG_OK)
+        self.assertEqual(estados["propia.png"], m.EST_IMG_HTTP_ERROR)
 
 
 if __name__ == "__main__":
