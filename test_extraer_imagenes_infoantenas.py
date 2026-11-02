@@ -2189,5 +2189,805 @@ class TestCliVersionado(VersionesBase):
             self.main("--promover-nueva", "--resume")
 
 
+# ---------------------------------------------------------------------------
+# Renombrado atómico con reintentos (bloqueos transitorios de Windows)
+# ---------------------------------------------------------------------------
+
+REPLACE_REAL = m.os.replace
+
+
+class FalloTransitorio:
+    """Sustituto de os.replace: falla con PermissionError las n primeras veces por destino."""
+
+    def __init__(self, fallos_por_destino=1, error=None):
+        self.fallos_por_destino = fallos_por_destino
+        self.error = error or (lambda: PermissionError(13, "Acceso denegado"))
+        self.intentos = {}
+
+    def __call__(self, origen, destino):
+        clave = str(destino)
+        self.intentos[clave] = self.intentos.get(clave, 0) + 1
+
+        if self.intentos[clave] <= self.fallos_por_destino:
+            raise self.error()
+
+        return REPLACE_REAL(origen, destino)
+
+
+class TestRenombradoAtomico(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        self.origen = self.tmp / "dato.json.tmp"
+        self.destino = self.tmp / "dato.json"
+        self.origen.write_text("nuevo", encoding="utf-8")
+
+    def renombrar(self, falla, **kwargs):
+        with mock.patch.object(m.os, "replace", side_effect=falla) as replace, \
+                mock.patch.object(m.time, "sleep") as dormir:
+            try:
+                m._renombrar(self.origen, self.destino, **kwargs)
+            finally:
+                self.replace, self.dormir = replace, dormir
+
+    def test_sin_fallos_no_espera(self):
+        self.renombrar(FalloTransitorio(0))
+
+        self.assertEqual(self.destino.read_text(encoding="utf-8"), "nuevo")
+        self.assertFalse(self.origen.exists())
+        self.dormir.assert_not_called()
+
+    def test_primer_intento_con_permissionerror_y_siguiente_correcto(self):
+        self.renombrar(FalloTransitorio(1))
+
+        self.assertEqual(self.replace.call_count, 2)
+        self.assertEqual(self.dormir.call_args_list, [mock.call(m.RENOMBRADO_ESPERA_S)])
+        self.assertEqual(self.destino.read_text(encoding="utf-8"), "nuevo")
+        self.assertFalse(self.origen.exists())
+
+    def test_varios_fallos_temporales_y_posterior_exito(self):
+        self.renombrar(FalloTransitorio(3), intentos=6, espera=0.1)
+
+        self.assertEqual(self.replace.call_count, 4)
+        self.assertEqual(self.dormir.call_args_list,
+                         [mock.call(0.1), mock.call(0.2), mock.call(0.4)])
+        self.assertEqual(self.destino.read_text(encoding="utf-8"), "nuevo")
+        self.assertFalse(self.origen.exists())
+
+    def test_ultimo_intento_correcto_aun_se_acepta(self):
+        self.renombrar(FalloTransitorio(2), intentos=3)
+
+        self.assertEqual(self.replace.call_count, 3)
+        self.assertEqual(self.destino.read_text(encoding="utf-8"), "nuevo")
+
+    def test_se_supera_el_maximo_y_se_propaga_el_error(self):
+        self.destino.write_text("anterior", encoding="utf-8")
+
+        with self.assertRaises(PermissionError):
+            self.renombrar(FalloTransitorio(100), intentos=4)
+
+        self.assertEqual(self.replace.call_count, 4)
+        self.assertEqual(self.dormir.call_count, 3)
+        self.assertEqual(self.destino.read_text(encoding="utf-8"), "anterior")
+        self.assertTrue(self.origen.exists())
+
+    def test_intentos_por_defecto_acotados(self):
+        with self.assertRaises(PermissionError):
+            self.renombrar(FalloTransitorio(100))
+
+        self.assertEqual(self.replace.call_count, m.RENOMBRADO_INTENTOS)
+        self.assertEqual(self.dormir.call_count, m.RENOMBRADO_INTENTOS - 1)
+
+    def test_otros_oserror_no_se_reintentan(self):
+        for error in (OSError("disco"), FileNotFoundError("falta"), FileExistsError("existe")):
+            with self.subTest(error=type(error).__name__):
+                with self.assertRaises(type(error)):
+                    self.renombrar(FalloTransitorio(100, error=lambda e=error: e))
+
+                self.assertEqual(self.replace.call_count, 1)
+                self.dormir.assert_not_called()
+
+    def test_error_no_oserror_se_propaga_sin_reintentar(self):
+        with self.assertRaises(ValueError):
+            self.renombrar(ValueError("otro"))
+
+        self.assertEqual(self.replace.call_count, 1)
+
+    def test_intentos_invalidos(self):
+        with self.assertRaises(ValueError):
+            m._renombrar(self.origen, self.destino, intentos=0)
+
+        self.assertTrue(self.origen.exists())
+
+
+class TestEscrituraAtomicaConReintentos(unittest.TestCase):
+    DATOS = {"clave": "ñandú", "lista": [1, 2, {"a": None}], "ok": True}
+    FILAS = [{"A": "1", "B": "ñ"}, {"A": "x;y", "B": ""}]
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+
+    def con_fallos(self, n):
+        return mock.patch.object(m.os, "replace", side_effect=FalloTransitorio(n)), \
+            mock.patch.object(m.time, "sleep")
+
+    def residuos(self):
+        return [p.name for p in self.tmp.rglob("*") if p.suffix in (".tmp", ".part")]
+
+    def test_json_identico_con_y_sin_fallos_transitorios(self):
+        esperado = json.dumps(self.DATOS, ensure_ascii=False, indent=2).encode("utf-8")
+
+        m.escribir_json_atomico(self.tmp / "limpio.json", self.DATOS)
+        replace, dormir = self.con_fallos(2)
+        with replace, dormir:
+            m.escribir_json_atomico(self.tmp / "con_fallos.json", self.DATOS)
+
+        self.assertEqual((self.tmp / "limpio.json").read_bytes(), esperado)
+        self.assertEqual((self.tmp / "con_fallos.json").read_bytes(), esperado)
+        self.assertEqual(self.residuos(), [])
+
+    def test_json_con_sufijo_e_indent_se_respetan(self):
+        m.escribir_json_atomico(self.tmp / "a.json", {"x": 1}, sufijo=".part", indent=None)
+
+        self.assertEqual((self.tmp / "a.json").read_bytes(), b'{"x": 1}')
+        self.assertEqual(self.residuos(), [])
+
+    def test_csv_identico_con_y_sin_fallos_transitorios(self):
+        esperado = ("\ufeffA;B\r\n1;ñ\r\n\"x;y\";\r\n").encode("utf-8")
+
+        m.escribir_csv_atomico(self.tmp / "limpio.csv", ["A", "B"], self.FILAS)
+        replace, dormir = self.con_fallos(2)
+        with replace, dormir:
+            m.escribir_csv_atomico(self.tmp / "con_fallos.csv", ["A", "B"], self.FILAS)
+
+        self.assertEqual((self.tmp / "limpio.csv").read_bytes(), esperado)
+        self.assertEqual((self.tmp / "con_fallos.csv").read_bytes(), esperado)
+        self.assertEqual(self.residuos(), [])
+
+    def test_fallo_definitivo_conserva_el_fichero_anterior_sin_parcial(self):
+        for escribir, nombre, previo in (
+            (lambda p: m.escribir_json_atomico(p, self.DATOS), "a.json", b'{"previo": 1}'),
+            (lambda p: m.escribir_csv_atomico(p, ["A", "B"], self.FILAS), "a.csv", b"previo"),
+        ):
+            with self.subTest(nombre):
+                destino = self.tmp / nombre
+                destino.write_bytes(previo)
+                replace, dormir = self.con_fallos(100)
+
+                with replace, dormir:
+                    with self.assertRaises(PermissionError):
+                        escribir(destino)
+
+                self.assertEqual(destino.read_bytes(), previo)
+
+    def test_fallo_definitivo_sin_fichero_anterior_no_crea_el_final(self):
+        replace, dormir = self.con_fallos(100)
+
+        with replace, dormir:
+            with self.assertRaises(PermissionError):
+                m.escribir_json_atomico(self.tmp / "a.json", self.DATOS)
+
+        self.assertFalse((self.tmp / "a.json").exists())
+
+    def test_primero_se_escribe_el_temporal_y_despues_se_sustituye(self):
+        vistos = {}
+
+        def espia(origen, destino):
+            vistos["temporal"] = Path(origen).read_text(encoding="utf-8")
+            vistos["final_existe"] = Path(destino).exists()
+            return REPLACE_REAL(origen, destino)
+
+        with mock.patch.object(m.os, "replace", side_effect=espia):
+            m.escribir_json_atomico(self.tmp / "a.json", {"x": 1})
+
+        self.assertEqual(json.loads(vistos["temporal"]), {"x": 1})
+        self.assertFalse(vistos["final_existe"])
+
+    def test_otro_oserror_no_se_reintenta(self):
+        with mock.patch.object(m.os, "replace", side_effect=OSError("disco")) as replace, \
+                mock.patch.object(m.time, "sleep") as dormir:
+            with self.assertRaises(OSError):
+                m.escribir_csv_atomico(self.tmp / "a.csv", ["A"], [{"A": "1"}])
+
+        self.assertEqual(replace.call_count, 1)
+        dormir.assert_not_called()
+
+
+class TestImagenesConBloqueosTransitorios(ImagenesBase):
+    def test_descarga_con_bloqueo_transitorio_al_publicar(self):
+        fallos = FalloTransitorio(1)
+
+        with mock.patch.object(m.os, "replace", side_effect=fallos), \
+                mock.patch.object(m.time, "sleep"):
+            r = self.procesar(Abridor(respuesta_imagen("JPEG", (400, 200))), "foto.jpg")
+
+        self.assertEqual(r["estado"], m.EST_IMG_OK)
+        self.assertTrue(self.existe_full() and self.existe_thumb())
+        self.assertEqual(sin_partes(self.tmp), [])
+
+    def test_regeneracion_de_miniatura_con_bloqueo_transitorio(self):
+        self.procesar(Abridor(respuesta_imagen("JPEG", (400, 200))), "foto.jpg")
+        (self.imagenes / "thumb" / "foto.jpg").unlink()
+
+        with mock.patch.object(m.os, "replace", side_effect=FalloTransitorio(1)), \
+                mock.patch.object(m.time, "sleep"):
+            r = self.procesar(Abridor(), "foto.jpg")
+
+        self.assertEqual((r["estado"], r["accion"]), (m.EST_IMG_OK, m.ACCION_SOLO_MINIATURA))
+        self.assertTrue(self.existe_thumb())
+
+
+class TestVersionadoConBloqueosTransitorios(VersionesBase):
+    def test_ejecucion_completa_con_un_bloqueo_por_cada_renombrado(self):
+        self.ejecutar()
+        limpia = {
+            p.relative_to(self.actual).as_posix(): p.read_bytes()
+            for p in self.actual.rglob("*")
+            if p.is_file() and p.suffix in (".csv", ".jpg", ".png")
+            and p.name not in ("log_markers.csv", "log_imatges.csv")
+        }
+
+        self.raiz = self.tmp / "con_bloqueos"
+        self.nueva, self.actual, self.anterior = m.rutas_versiones(self.raiz)
+        fallos = FalloTransitorio(1)
+
+        with mock.patch.object(m.os, "replace", side_effect=fallos), \
+                mock.patch.object(m.time, "sleep"):
+            resultado = self.ejecutar()
+
+        self.assertTrue(resultado["promovida"])
+        self.assertTrue(all(n >= 2 for n in fallos.intentos.values()))
+        self.assertEqual(self.residuos_en_version(), [])
+        con_bloqueos = {
+            p.relative_to(self.actual).as_posix(): p.read_bytes()
+            for p in self.actual.rglob("*")
+            if p.is_file() and p.suffix in (".csv", ".jpg", ".png")
+            and p.name not in ("log_markers.csv", "log_imatges.csv")
+        }
+        self.assertEqual(con_bloqueos, limpia)
+
+    def residuos_en_version(self):
+        return [p.name for p in self.actual.rglob("*") if p.suffix in (".tmp", ".part")]
+
+
+# ---------------------------------------------------------------------------
+# FREQUENCIES_ANTENASMOVILES.csv
+# ---------------------------------------------------------------------------
+
+COLUMNAS_FRECUENCIAS = [
+    "GIS_ID", "CODI_FREQUENCIA", "FREQUENCIA", "ESTAT", "PRIMERA_VEGADA_VISTA",
+    "ULTIMA_VEGADA_VISTA", "ULTIMA_VEGADA_ACTUALITZADA", "CODI_OPERADOR",
+]
+
+
+def frecuencia(codigo, gis_id="1", estat=False, freq="949.90 - 959.90"):
+    return [codigo, gis_id, freq, estat, "24/09/2024", "03/09/2026", "25/09/2024", "1"]
+
+
+def elemento_con(frecuencias, codigo="1"):
+    return [[codigo], ["OP", "1", "1"], ["DIR", 41.0, 2.0, "1m"], frecuencias, [], False, []]
+
+
+def referencia_original(markers_dir):
+    """Réplica de la lógica validada del script original (glob de *.json)."""
+    filas = []
+
+    for path in sorted(markers_dir.glob("*.json")):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        respuesta = data.get("RESPUESTA", [])
+
+        if not isinstance(respuesta, list):
+            continue
+
+        for marcador in respuesta:
+            if not isinstance(marcador, list) or len(marcador) < 4:
+                continue
+            if not isinstance(marcador[3], list):
+                continue
+
+            for freq in marcador[3]:
+                if not isinstance(freq, list) or len(freq) < 8:
+                    continue
+
+                filas.append({
+                    "GIS_ID": str(freq[1]).strip(),
+                    "CODI_FREQUENCIA": str(freq[0]).strip(),
+                    "FREQUENCIA": str(freq[2]).strip(),
+                    "ESTAT": str(freq[3]),
+                    "PRIMERA_VEGADA_VISTA": str(freq[4]).strip(),
+                    "ULTIMA_VEGADA_VISTA": str(freq[5]).strip(),
+                    "ULTIMA_VEGADA_ACTUALITZADA": str(freq[6]).strip(),
+                    "CODI_OPERADOR": str(freq[7]).strip(),
+                })
+
+    return filas
+
+
+def guardar_marker(markers_dir, gis_id, data):
+    markers_dir.mkdir(parents=True, exist_ok=True)
+    m.guardar_respuesta(
+        markers_dir / m.nombre_fichero_marker(gis_id),
+        gis_id,
+        {"http_status": 200, "url": "u", "content_type": "application/json", "data": data},
+    )
+
+
+class TestExtraerFrecuencias(unittest.TestCase):
+    def test_columnas_exactas_y_orden(self):
+        self.assertEqual(m.CAMPOS_FRECUENCIAS, COLUMNAS_FRECUENCIAS)
+        self.assertEqual(m.NOMBRE_FRECUENCIAS, "FREQUENCIES_ANTENASMOVILES.csv")
+
+        filas, _, _ = m.extraer_frecuencias(MARKER_REAL)
+
+        self.assertEqual(list(filas[0]), COLUMNAS_FRECUENCIAS)
+
+    def test_origen_de_cada_campo(self):
+        filas, mal, sin_bloque = m.extraer_frecuencias(MARKER_REAL)
+
+        self.assertEqual((mal, sin_bloque), (0, 0))
+        self.assertEqual(filas, [{
+            "GIS_ID": "0000758",
+            "CODI_FREQUENCIA": "BB-2402052",
+            "FREQUENCIA": "949.90 - 959.90",
+            "ESTAT": "False",
+            "PRIMERA_VEGADA_VISTA": "24/09/2024",
+            "ULTIMA_VEGADA_VISTA": "03/09/2026",
+            "ULTIMA_VEGADA_ACTUALITZADA": "24/09/2024",
+            "CODI_OPERADOR": "1",
+        }])
+
+    def test_estat_se_conserva_como_texto_del_valor(self):
+        filas, _, _ = m.extraer_frecuencias([elemento_con([
+            frecuencia("A", estat=False), frecuencia("B", estat=True),
+        ])])
+
+        self.assertEqual([f["ESTAT"] for f in filas], ["False", "True"])
+
+    def test_resto_de_campos_se_recortan_pero_estat_no(self):
+        freq = [" A ", " 1 ", " f ", " x ", " p ", " u ", " a ", " o "]
+        filas, _, _ = m.extraer_frecuencias([elemento_con([freq])])
+
+        self.assertEqual(filas[0]["CODI_FREQUENCIA"], "A")
+        self.assertEqual(filas[0]["ESTAT"], " x ")
+
+    def test_varias_frecuencias_por_marker_en_orden_original(self):
+        filas, _, _ = m.extraer_frecuencias([elemento_con([
+            frecuencia("C"), frecuencia("A"), frecuencia("B"),
+        ])])
+
+        self.assertEqual([f["CODI_FREQUENCIA"] for f in filas], ["C", "A", "B"])
+
+    def test_varias_respuestas_por_json(self):
+        filas, _, _ = m.extraer_frecuencias([
+            elemento_con([frecuencia("A", "1")], "1"),
+            elemento_con([frecuencia("B", "2"), frecuencia("C", "2")], "2"),
+        ])
+
+        self.assertEqual([(f["GIS_ID"], f["CODI_FREQUENCIA"]) for f in filas],
+                         [("1", "A"), ("2", "B"), ("2", "C")])
+
+    def test_respuesta_vacia_da_cero_filas_sin_incidencias(self):
+        self.assertEqual(m.extraer_frecuencias([]), ([], 0, 0))
+
+    def test_elemento_con_lista_de_frecuencias_vacia_no_es_incidencia(self):
+        self.assertEqual(m.extraer_frecuencias([elemento_con([])]), ([], 0, 0))
+
+    def test_frecuencia_mal_formada_se_cuenta_y_el_resto_sigue(self):
+        filas, mal, sin_bloque = m.extraer_frecuencias([elemento_con([
+            frecuencia("A"), ["corta", "1", "f"], "texto", None, frecuencia("B"),
+        ])])
+
+        self.assertEqual([f["CODI_FREQUENCIA"] for f in filas], ["A", "B"])
+        self.assertEqual((mal, sin_bloque), (3, 0))
+
+    def test_frecuencia_con_mas_de_ocho_posiciones_se_acepta(self):
+        filas, mal, _ = m.extraer_frecuencias([elemento_con([frecuencia("A") + ["extra"]])])
+
+        self.assertEqual(len(filas), 1)
+        self.assertEqual(mal, 0)
+        self.assertEqual(list(filas[0]), COLUMNAS_FRECUENCIAS)
+
+    def test_elemento_sin_bloque_valido_se_cuenta(self):
+        filas, mal, sin_bloque = m.extraer_frecuencias([
+            [["1"], ["OP"], ["D"], "no es lista"],
+            [["2"], ["OP"], ["D"]],
+            "no es lista",
+            elemento_con([frecuencia("A")]),
+        ])
+
+        self.assertEqual([f["CODI_FREQUENCIA"] for f in filas], ["A"])
+        self.assertEqual((mal, sin_bloque), (0, 3))
+
+    def test_respuesta_que_no_es_lista_no_lanza(self):
+        self.assertEqual(m.extraer_frecuencias({"error": "x"}), ([], 0, 0))
+
+
+class TestGenerarFrecuencias(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        self.markers = self.tmp / "markers"
+        self.destino = self.tmp / m.NOMBRE_FRECUENCIAS
+
+    def leer(self):
+        with self.destino.open(encoding="utf-8-sig", newline="") as f:
+            return list(csv.DictReader(f, delimiter=";"))
+
+    def test_formato_del_fichero(self):
+        guardar_marker(self.markers, "0000758", MARKER_REAL)
+        resumen = m.generar_frecuencias(self.markers, ["0000758"], self.destino)
+
+        contenido = self.destino.read_bytes()
+        self.assertTrue(contenido.startswith(b"\xef\xbb\xbf"))
+        primera = contenido.decode("utf-8-sig").splitlines()[0]
+        self.assertEqual(primera, ";".join(COLUMNAS_FRECUENCIAS))
+        self.assertEqual(self.leer()[0]["ESTAT"], "False")
+        self.assertEqual(resumen["filas"], 1)
+        self.assertEqual(resumen["markers_procesados"], 1)
+
+    def test_respuesta_vacia_genera_solo_cabecera(self):
+        guardar_marker(self.markers, "999", [])
+        resumen = m.generar_frecuencias(self.markers, ["999"], self.destino)
+
+        self.assertEqual(self.leer(), [])
+        self.assertEqual(self.destino.read_text(encoding="utf-8-sig").strip(),
+                         ";".join(COLUMNAS_FRECUENCIAS))
+        self.assertEqual(resumen["filas"], 0)
+        self.assertEqual(resumen["markers_procesados"], 1)
+        self.assertEqual(resumen["frecuencias_mal_formadas"], 0)
+
+    def test_orden_determinista_sigue_la_seleccion(self):
+        guardar_marker(self.markers, "A", [elemento_con([frecuencia("A2"), frecuencia("A1")])])
+        guardar_marker(self.markers, "B", [elemento_con([frecuencia("B1")])])
+
+        m.generar_frecuencias(self.markers, ["B", "A"], self.destino)
+        self.assertEqual([f["CODI_FREQUENCIA"] for f in self.leer()], ["B1", "A2", "A1"])
+
+        m.generar_frecuencias(self.markers, ["A", "B"], self.destino)
+        self.assertEqual([f["CODI_FREQUENCIA"] for f in self.leer()], ["A2", "A1", "B1"])
+
+    def test_solo_se_leen_los_gis_id_de_la_seleccion(self):
+        guardar_marker(self.markers, "A", [elemento_con([frecuencia("A1")])])
+        guardar_marker(self.markers, "B", [elemento_con([frecuencia("B1")])])
+
+        m.generar_frecuencias(self.markers, ["A"], self.destino)
+
+        self.assertEqual([f["CODI_FREQUENCIA"] for f in self.leer()], ["A1"])
+
+    def test_duplicados_se_detectan_pero_no_se_eliminan(self):
+        guardar_marker(self.markers, "A", [elemento_con([frecuencia("X"), frecuencia("Y")])])
+        guardar_marker(self.markers, "B", [elemento_con([frecuencia("X"), frecuencia("Z", "2")])])
+
+        resumen = m.generar_frecuencias(self.markers, ["A", "B"], self.destino)
+
+        self.assertEqual(len(self.leer()), 4)
+        self.assertEqual(resumen["filas"], 4)
+        self.assertEqual(resumen["codi_frequencia_distintos"], 3)
+        self.assertEqual(resumen["codi_frequencia_repetidos"], 1)
+        self.assertEqual(resumen["filas_con_codi_frequencia_repetido"], 2)
+        self.assertEqual(resumen["codi_frequencia_repetidos_detalle"], ["X"])
+        self.assertEqual(resumen["filas_duplicadas_exactas"], 1)
+
+    def test_mismo_codigo_con_datos_distintos_no_es_duplicado_exacto(self):
+        guardar_marker(self.markers, "A", [elemento_con([
+            frecuencia("X"), frecuencia("X", freq="1800"),
+        ])])
+        resumen = m.generar_frecuencias(self.markers, ["A"], self.destino)
+
+        self.assertEqual(resumen["codi_frequencia_repetidos"], 1)
+        self.assertEqual(resumen["filas_duplicadas_exactas"], 0)
+
+    def test_sin_duplicados(self):
+        guardar_marker(self.markers, "A", [elemento_con([frecuencia("X"), frecuencia("Y")])])
+        resumen = m.generar_frecuencias(self.markers, ["A"], self.destino)
+
+        self.assertEqual(resumen["codi_frequencia_repetidos"], 0)
+        self.assertEqual(resumen["codi_frequencia_repetidos_detalle"], [])
+        self.assertEqual(resumen["filas_duplicadas_exactas"], 0)
+
+    def test_incidencias_se_acumulan_en_el_resumen(self):
+        guardar_marker(self.markers, "A", [
+            elemento_con([frecuencia("X"), ["corta"]]),
+            [["2"], ["OP"], ["D"], "no lista"],
+        ])
+        resumen = m.generar_frecuencias(self.markers, ["A"], self.destino)
+
+        self.assertEqual(resumen["filas"], 1)
+        self.assertEqual(resumen["frecuencias_mal_formadas"], 1)
+        self.assertEqual(resumen["elementos_sin_bloque_frecuencias"], 1)
+
+    def test_marker_ausente_o_invalido_no_rompe(self):
+        guardar_marker(self.markers, "A", [elemento_con([frecuencia("A1")])])
+        (self.markers / m.nombre_fichero_marker("C")).write_text("{no json", encoding="utf-8")
+
+        resumen = m.generar_frecuencias(self.markers, ["A", "B", "C"], self.destino)
+
+        self.assertEqual(resumen["markers_procesados"], 1)
+        self.assertEqual(resumen["markers_no_disponibles"], 2)
+        self.assertEqual(len(self.leer()), 1)
+
+    def test_escritura_atomica_sin_residuos(self):
+        guardar_marker(self.markers, "A", [elemento_con([frecuencia("A1")])])
+        m.generar_frecuencias(self.markers, ["A"], self.destino)
+
+        self.assertEqual(list(self.tmp.rglob("*.part")), [])
+        self.assertEqual(list(self.tmp.rglob("*.tmp")), [])
+
+    def test_fallo_al_renombrar_conserva_el_fichero_anterior(self):
+        guardar_marker(self.markers, "A", [elemento_con([frecuencia("A1")])])
+        self.destino.write_text("previo", encoding="utf-8")
+
+        with mock.patch.object(m.os, "replace", side_effect=OSError("bloqueado")):
+            with self.assertRaises(OSError):
+                m.generar_frecuencias(self.markers, ["A"], self.destino)
+
+        self.assertEqual(self.destino.read_text(encoding="utf-8"), "previo")
+
+    def test_no_usa_la_red(self):
+        guardar_marker(self.markers, "A", [elemento_con([frecuencia("A1")])])
+
+        with mock.patch.object(m.urllib.request, "urlopen", side_effect=AssertionError("red")):
+            m.generar_frecuencias(self.markers, ["A"], self.destino)
+
+    def test_listar_gis_ids_guardados(self):
+        guardar_marker(self.markers, "B", [])
+        guardar_marker(self.markers, "A", [])
+        (self.markers / "roto.json").write_text("{no json", encoding="utf-8")
+
+        gis_ids, ilegibles = m.listar_gis_ids_guardados(self.markers)
+
+        self.assertEqual(sorted(gis_ids), ["A", "B"])
+        self.assertEqual(ilegibles, 1)
+
+
+class FrecuenciasVersionesBase(VersionesBase):
+    """VersionesBase con frecuencias en las respuestas: 3 + 1 + 0 = 4 filas."""
+
+    def setUp(self):
+        super().setUp()
+        self.respuestas["0000758"][0][3] = [
+            frecuencia("F1", "0000758"), frecuencia("F2", "0000758", True),
+        ]
+        self.respuestas["0000758"].append(
+            elemento_con([frecuencia("F3", "0000758")], "0000758")
+        )
+        self.respuestas["4300034"][0][3] = [frecuencia("F4", "4300034")]
+
+    def filas_frecuencias(self, version):
+        return self.leer_csv(version, m.NOMBRE_FRECUENCIAS)
+
+
+class TestFrecuenciasEnVersion(FrecuenciasVersionesBase):
+    def test_se_genera_en_nueva_y_se_promociona_a_actual(self):
+        vistos = {}
+        original = m.crear_completa
+
+        def espia(version_dir, metadatos):
+            vistos["nueva"] = (version_dir / m.NOMBRE_FRECUENCIAS).is_file()
+            original(version_dir, metadatos)
+
+        with mock.patch.object(m, "crear_completa", side_effect=espia):
+            resultado = self.ejecutar()
+
+        self.assertTrue(vistos["nueva"])
+        self.assertTrue(resultado["promovida"])
+        self.assertFalse(self.nueva.exists())
+        self.assertIn(m.NOMBRE_FRECUENCIAS, m.ARCHIVOS_VERSION)
+        filas = self.filas_frecuencias(self.actual)
+        self.assertEqual([f["CODI_FREQUENCIA"] for f in filas], ["F1", "F2", "F3", "F4"])
+        self.assertEqual([f["ESTAT"] for f in filas], ["False", "True", "False", "False"])
+        self.assertEqual(list(filas[0]), COLUMNAS_FRECUENCIAS)
+
+    def test_bloque_de_frecuencias_en_resum_json(self):
+        self.ejecutar()
+        bloque = self.leer_resumen(self.actual)["frecuencias"]
+
+        self.assertEqual(bloque["fichero"], m.NOMBRE_FRECUENCIAS)
+        self.assertEqual(bloque["filas"], 4)
+        self.assertEqual(bloque["markers_procesados"], 3)
+        self.assertEqual(bloque["frecuencias_mal_formadas"], 0)
+        self.assertEqual(bloque["codi_frequencia_repetidos"], 0)
+        self.assertEqual(bloque["codi_frequencia_distintos"], 4)
+
+    def test_duplicados_se_reportan_sin_impedir_la_promocion(self):
+        self.respuestas["4300034"][0][3] = [frecuencia("F1", "4300034")]
+        resultado = self.ejecutar()
+
+        self.assertTrue(resultado["promovida"])
+        self.assertEqual(len(self.filas_frecuencias(self.actual)), 4)
+        bloque = self.leer_resumen(self.actual)["frecuencias"]
+        self.assertEqual(bloque["codi_frequencia_repetidos"], 1)
+        self.assertEqual(bloque["codi_frequencia_repetidos_detalle"], ["F1"])
+
+    def test_frecuencia_mal_formada_no_rompe_la_ejecucion(self):
+        self.respuestas["4300034"][0][3] = [["corta"], frecuencia("F4", "4300034")]
+        resultado = self.ejecutar()
+
+        self.assertTrue(resultado["promovida"])
+        self.assertEqual(self.leer_resumen(self.actual)["frecuencias"]["frecuencias_mal_formadas"], 1)
+
+    def test_ninguna_llamada_http_adicional(self):
+        markers, imagenes = self.marcadores(), self.imagenes_ok()
+        self.ejecutar(markers=markers, imagenes=imagenes)
+
+        self.assertEqual(len(markers.peticiones), 3)
+        self.assertEqual(len(imagenes.peticiones), 2)
+        self.assertTrue(all("/v1/markers" in p.full_url for p in markers.peticiones))
+
+    def test_generar_frecuencias_no_hace_peticiones(self):
+        with mock.patch.object(m, "generar_frecuencias", wraps=m.generar_frecuencias) as espia, \
+                mock.patch.object(m.urllib.request, "urlopen", side_effect=AssertionError("red")):
+            self.ejecutar()
+
+        espia.assert_called_once()
+
+    def test_resume_genera_el_csv_completo(self):
+        resultado = self.ejecutar(imagenes=Abridor(respuesta_imagen("JPEG"), http_error(404)))
+        self.assertFalse(resultado["promocionable"])
+
+        markers = Abridor()
+        resultado = self.ejecutar(
+            markers=markers, imagenes=Abridor(respuesta_imagen("PNG", (500, 500))), resume=True
+        )
+
+        self.assertEqual(markers.peticiones, [])
+        self.assertTrue(resultado["promovida"])
+        filas = self.filas_frecuencias(self.actual)
+        self.assertEqual([f["CODI_FREQUENCIA"] for f in filas], ["F1", "F2", "F3", "F4"])
+        self.assertEqual(self.leer_resumen(self.actual)["frecuencias"]["filas"], 4)
+
+    def test_resume_con_markers_pendientes_incluye_los_reutilizados(self):
+        with self.assertRaises(KeyboardInterrupt):
+            self.ejecutar(markers=Abridor(
+                RespuestaFalsa(json_bytes(self.respuestas["0000758"])), KeyboardInterrupt(),
+            ))
+
+        markers = Abridor(
+            RespuestaFalsa(json_bytes(self.respuestas["4300034"])), RespuestaFalsa(b"[]"),
+        )
+        resultado = self.ejecutar(markers=markers, resume=True)
+
+        self.assertEqual(len(markers.peticiones), 2)
+        self.assertTrue(resultado["promovida"])
+        self.assertEqual([f["CODI_FREQUENCIA"] for f in self.filas_frecuencias(self.actual)],
+                         ["F1", "F2", "F3", "F4"])
+
+    def test_version_sin_el_csv_no_se_promociona(self):
+        def sin_escribir(markers_dir, gis_ids, destino):
+            return {"filas": 0}
+
+        with mock.patch.object(m, "generar_frecuencias", side_effect=sin_escribir):
+            resultado = self.ejecutar()
+
+        self.assertFalse(resultado["promocionable"])
+        self.assertFalse(resultado["promovida"])
+        self.assertIn("FALTA_" + m.NOMBRE_FRECUENCIAS, resultado["motivos"])
+        self.assertIn("FRECUENCIAS_INVALIDO", resultado["motivos"])
+        self.assertFalse((self.nueva / m.MARCADOR_COMPLETA).exists())
+        self.assertTrue(self.nueva.is_dir())
+        self.assertFalse(self.actual.exists())
+
+    def test_version_con_csv_inconsistente_no_se_promociona(self):
+        original = m.generar_frecuencias
+
+        def recortando(markers_dir, gis_ids, destino):
+            resumen = original(markers_dir, gis_ids, destino)
+            lineas = destino.read_text(encoding="utf-8-sig").splitlines()
+            destino.write_text("\n".join(lineas[:-1]) + "\n", encoding="utf-8-sig")
+            return resumen
+
+        with mock.patch.object(m, "generar_frecuencias", side_effect=recortando):
+            resultado = self.ejecutar()
+
+        self.assertFalse(resultado["promovida"])
+        self.assertIn("FRECUENCIAS_INCONSISTENTE", resultado["motivos"])
+
+    def test_verificacion_detecta_csv_ausente_cabecera_o_filas(self):
+        self.ejecutar()
+        resumen = self.leer_resumen(self.actual)
+        ruta = self.actual / m.NOMBRE_FRECUENCIAS
+        original = ruta.read_bytes()
+        self.assertEqual(m.verificar_version_en_disco(self.actual, resumen), [])
+
+        ruta.write_text("OTRA;CABECERA\n1;2\n", encoding="utf-8-sig")
+        self.assertEqual(m.verificar_version_en_disco(self.actual, resumen),
+                         ["FRECUENCIAS_INVALIDO"])
+
+        ruta.write_bytes(original)
+        resumen["frecuencias"]["filas"] += 1
+        self.assertEqual(m.verificar_version_en_disco(self.actual, resumen),
+                         ["FRECUENCIAS_INCONSISTENTE"])
+
+        ruta.unlink()
+        motivos = m.verificar_version_en_disco(self.actual, resumen)
+        self.assertIn("FALTA_" + m.NOMBRE_FRECUENCIAS, motivos)
+        self.assertIn("FRECUENCIAS_INVALIDO", motivos)
+
+    def test_no_cambian_imagenes_ni_control_ni_descargas(self):
+        self.ejecutar()
+        con_frecuencias = self.actual
+
+        self.raiz = self.tmp / "sin_frecuencias"
+        self.nueva, self.actual, self.anterior = m.rutas_versiones(self.raiz)
+
+        def sin_escribir(markers_dir, gis_ids, destino):
+            return {"filas": 0}
+
+        with mock.patch.object(m, "generar_frecuencias", side_effect=sin_escribir):
+            self.ejecutar()
+
+        sin_frecuencias = self.nueva
+
+        for nombre in ("IMATGES_INFOANTENAS.csv", "CONTROL_GIS_ID.csv"):
+            self.assertEqual((con_frecuencias / nombre).read_bytes(),
+                             (sin_frecuencias / nombre).read_bytes(), nombre)
+
+        for subdirectorio in ("full", "thumb"):
+            a = {p.name: p.read_bytes() for p in (con_frecuencias / subdirectorio).iterdir()}
+            b = {p.name: p.read_bytes() for p in (sin_frecuencias / subdirectorio).iterdir()}
+            self.assertEqual(a, b, subdirectorio)
+
+    def test_equivalencia_con_el_script_standalone_y_la_referencia_original(self):
+        import generar_frecuencies_desde_markers as standalone
+
+        self.ejecutar()
+        salida = self.tmp / "standalone.csv"
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            codigo = standalone.main(
+                ["--markers-dir", str(self.actual / "markers"), "--output", str(salida)]
+            )
+
+        self.assertEqual(codigo, 0)
+        self.assertEqual(salida.read_bytes(), (self.actual / m.NOMBRE_FRECUENCIAS).read_bytes())
+        self.assertEqual(self.filas_frecuencias(self.actual),
+                         referencia_original(self.actual / "markers"))
+
+
+class TestFrecuenciasOnlineSinVersionado(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        self.inv = self.tmp / "inv.csv"
+        escribir_inventario(self.inv, [
+            ("0000758", "VODAFONE ESPAÑA, S.A.U.", 41.321464, 2.014425),
+            ("999", "OP", 41.0, 2.0),
+        ])
+
+    def test_csv_junto_a_los_demas_y_resumen_online(self):
+        abridor = Abridor(RespuestaFalsa(json_bytes(MARKER_REAL)), RespuestaFalsa(b"[]"))
+        resumen, _ = m.ejecutar_online(
+            self.inv, self.tmp / "out", self.tmp / "out" / "_treball",
+            abrir=abridor, limitador=m.Limitador(0.0), parametros={"timeout": 5, "reintentos": 0},
+            dormir=lambda s: None, imprimir=lambda *_: None,
+        )
+
+        self.assertEqual(len(abridor.peticiones), 2)
+        csv_path = self.tmp / "out" / m.NOMBRE_FRECUENCIAS
+        with csv_path.open(encoding="utf-8-sig", newline="") as f:
+            filas = list(csv.DictReader(f, delimiter=";"))
+        self.assertEqual([f["CODI_FREQUENCIA"] for f in filas], ["BB-2402052"])
+        self.assertEqual(resumen["frecuencias"]["filas"], 1)
+
+        guardado = json.loads((self.tmp / "out" / "resum_online.json").read_text(encoding="utf-8"))
+        self.assertEqual(guardado["frecuencias"]["filas"], 1)
+
+    def test_parada_por_errores_no_genera_el_csv(self):
+        resumen, _ = m.ejecutar_online(
+            self.inv, self.tmp / "out", self.tmp / "out" / "_treball",
+            abrir=Abridor(por_defecto=http_error(403)), limitador=m.Limitador(0.0),
+            parametros={"timeout": 5, "reintentos": 0}, max_errores_consecutivos=1,
+            dormir=lambda s: None, imprimir=lambda *_: None,
+        )
+
+        self.assertIsNone(resumen)
+        self.assertFalse((self.tmp / "out" / m.NOMBRE_FRECUENCIAS).exists())
+
+
 if __name__ == "__main__":
     unittest.main()

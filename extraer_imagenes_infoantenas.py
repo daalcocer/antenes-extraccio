@@ -54,6 +54,15 @@ Imágenes (--descargar-imagenes, solo online):
   <imagenes>) y ESTADO_DESCARGA en IMATGES_INFOANTENAS.csv, y log_imatges.csv
   (una fila por fichero único) en el directorio de trabajo.
 
+  Frecuencias (modo online): tras generar_salidas se escribe
+    FREQUENCIES_ANTENASMOVILES.csv junto a los demás CSV, leyendo únicamente las
+    respuestas ya guardadas en <trabajo>/markers/ (elemento[3] de la respuesta
+    cruda): sin peticiones ni descargas nuevas. Una fila por frecuencia, en el
+    orden de la selección y el original de cada respuesta. Los duplicados de
+    CODI_FREQUENCIA se detectan y se reportan en resum.json (bloque
+    "frecuencias"), nunca se eliminan. Forma parte de la verificación de la
+    versión: si falta o es inconsistente, no se promociona.
+
 Reglas:
 - Gis_ID siempre como texto literal (sin quitar ceros ni normalizar).
 - El cruce es solo por coincidencia literal de código.
@@ -257,6 +266,32 @@ CAMPOS_IMAGENES = [
     "OPERADOR_COINCIDE",
     "DISTANCIA_M",
 ]
+
+NOMBRE_FRECUENCIAS = "FREQUENCIES_ANTENASMOVILES.csv"
+
+CAMPOS_FRECUENCIAS = [
+    "GIS_ID",
+    "CODI_FREQUENCIA",
+    "FREQUENCIA",
+    "ESTAT",
+    "PRIMERA_VEGADA_VISTA",
+    "ULTIMA_VEGADA_VISTA",
+    "ULTIMA_VEGADA_ACTUALITZADA",
+    "CODI_OPERADOR",
+]
+
+# Posición de cada campo dentro de una frecuencia de elemento[3] de /v1/markers.
+POSICIONES_FRECUENCIA = {
+    "GIS_ID": 1,
+    "CODI_FREQUENCIA": 0,
+    "FREQUENCIA": 2,
+    "ESTAT": 3,
+    "PRIMERA_VEGADA_VISTA": 4,
+    "ULTIMA_VEGADA_VISTA": 5,
+    "ULTIMA_VEGADA_ACTUALITZADA": 6,
+    "CODI_OPERADOR": 7,
+}
+MIN_CAMPOS_FRECUENCIA = 8
 
 
 # ---------------------------------------------------------------------------
@@ -866,6 +901,34 @@ def formatear_fila_imagen(fila):
     return salida
 
 
+RENOMBRADO_INTENTOS = 6
+RENOMBRADO_ESPERA_S = 0.1
+
+
+def _renombrar(origen, destino, intentos=RENOMBRADO_INTENTOS, espera=RENOMBRADO_ESPERA_S):
+    """
+    Única estrategia de renombrado/sustitución atómica (os.replace) con
+    reintentos acotados.
+
+    En Windows, un PermissionError al sustituir un fichero recién escrito suele
+    ser un bloqueo transitorio (antivirus, indexador). Se reintenta solo ese
+    error, con espera exponencial (espera, 2*espera, ...) y como máximo
+    `intentos` intentos. Cualquier otro error, o el PermissionError del último
+    intento, se propaga. Mientras falle, el destino anterior queda intacto.
+    """
+    if intentos < 1:
+        raise ValueError("intentos debe ser al menos 1.")
+
+    for intento in range(1, intentos + 1):
+        try:
+            os.replace(origen, destino)
+            return
+        except PermissionError:
+            if intento == intentos:
+                raise
+            time.sleep(espera * 2 ** (intento - 1))
+
+
 def escribir_csv_atomico(path: Path, fieldnames, filas):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporal = path.with_name(path.name + ".tmp")
@@ -880,7 +943,7 @@ def escribir_csv_atomico(path: Path, fieldnames, filas):
         writer.writeheader()
         writer.writerows(filas)
 
-    os.replace(temporal, path)
+    _renombrar(temporal, path)
 
 
 def escribir_json_atomico(path: Path, datos, sufijo=".tmp", indent=2):
@@ -890,7 +953,126 @@ def escribir_json_atomico(path: Path, datos, sufijo=".tmp", indent=2):
     with temporal.open("w", encoding="utf-8", newline="") as f:
         json.dump(datos, f, ensure_ascii=False, indent=indent)
 
-    os.replace(temporal, path)
+    _renombrar(temporal, path)
+
+
+def extraer_frecuencias(respuesta):
+    """
+    Extrae las frecuencias de una respuesta cruda de /v1/markers (elemento[3]).
+
+    Devuelve (filas, mal_formadas, elementos_sin_bloque). Las filas respetan el
+    orden original. Un elemento que no es lista, que no tiene elemento[3] o
+    cuyo elemento[3] no es lista cuenta en elementos_sin_bloque; una frecuencia
+    que no es lista o tiene menos de 8 posiciones cuenta en mal_formadas. Nunca
+    lanza por el contenido: una respuesta vacía da 0 filas sin incidencias.
+    """
+    filas = []
+    mal_formadas = 0
+    elementos_sin_bloque = 0
+
+    if not isinstance(respuesta, list):
+        return filas, mal_formadas, elementos_sin_bloque
+
+    for elemento in respuesta:
+        if not isinstance(elemento, list) or len(elemento) < 4 or not isinstance(elemento[3], list):
+            elementos_sin_bloque += 1
+            continue
+
+        for freq in elemento[3]:
+            if not isinstance(freq, list) or len(freq) < MIN_CAMPOS_FRECUENCIA:
+                mal_formadas += 1
+                continue
+
+            fila = {
+                campo: str(freq[posicion]).strip()
+                for campo, posicion in POSICIONES_FRECUENCIA.items()
+            }
+            fila["ESTAT"] = str(freq[POSICIONES_FRECUENCIA["ESTAT"]])
+            filas.append(fila)
+
+    return filas, mal_formadas, elementos_sin_bloque
+
+
+def listar_gis_ids_guardados(markers_dir: Path):
+    """
+    Gis_ID de las respuestas guardadas en markers_dir, en orden de nombre de
+    fichero. Devuelve (gis_ids, ilegibles). Solo para uso fuera de una
+    ejecución, donde no hay selección: el flujo normal usa la selección.
+    """
+    gis_ids = []
+    ilegibles = 0
+
+    for ruta in sorted(markers_dir.glob("*.json")):
+        try:
+            with ruta.open("r", encoding="utf-8") as f:
+                gis_id = json.load(f).get("GIS_ID")
+        except (OSError, ValueError, AttributeError):
+            gis_id = None
+
+        if isinstance(gis_id, str) and gis_id:
+            gis_ids.append(gis_id)
+        else:
+            ilegibles += 1
+
+    return gis_ids, ilegibles
+
+
+def generar_frecuencias(markers_dir: Path, gis_ids, destino: Path):
+    """
+    Genera el CSV de frecuencias a partir de las respuestas ya guardadas en
+    markers_dir, sin ninguna petición de red. Sigue el orden de gis_ids y, en
+    cada respuesta, el orden original. No elimina duplicados: los detecta y los
+    reporta. Devuelve el bloque de resumen.
+    """
+    filas = []
+    vistos_codigos = Counter()
+    vistas_exactas = set()
+    markers_procesados = 0
+    markers_no_disponibles = 0
+    mal_formadas = 0
+    elementos_sin_bloque = 0
+    filas_duplicadas_exactas = 0
+
+    for gis_id in gis_ids:
+        ruta = markers_dir / nombre_fichero_marker(gis_id)
+        registro = leer_respuesta_guardada(ruta, gis_id) if ruta.exists() else None
+
+        if registro is None:
+            markers_no_disponibles += 1
+            continue
+
+        markers_procesados += 1
+        nuevas, malas, sin_bloque = extraer_frecuencias(registro["RESPUESTA"])
+        mal_formadas += malas
+        elementos_sin_bloque += sin_bloque
+
+        for fila in nuevas:
+            clave = tuple(fila[campo] for campo in CAMPOS_FRECUENCIAS)
+
+            if clave in vistas_exactas:
+                filas_duplicadas_exactas += 1
+            vistas_exactas.add(clave)
+            vistos_codigos[fila["CODI_FREQUENCIA"]] += 1
+
+        filas.extend(nuevas)
+
+    escribir_csv_atomico(destino, CAMPOS_FRECUENCIAS, filas)
+
+    repetidos = sorted(c for c, n in vistos_codigos.items() if n > 1)
+
+    return {
+        "fichero": destino.name,
+        "markers_procesados": markers_procesados,
+        "markers_no_disponibles": markers_no_disponibles,
+        "filas": len(filas),
+        "frecuencias_mal_formadas": mal_formadas,
+        "elementos_sin_bloque_frecuencias": elementos_sin_bloque,
+        "filas_duplicadas_exactas": filas_duplicadas_exactas,
+        "codi_frequencia_distintos": len(vistos_codigos),
+        "codi_frequencia_repetidos": len(repetidos),
+        "filas_con_codi_frequencia_repetido": sum(vistos_codigos[c] for c in repetidos),
+        "codi_frequencia_repetidos_detalle": repetidos[:MAX_ELEMENTOS_LISTA_RESUMEN],
+    }
 
 
 def sha256_fichero(path: Path):
@@ -1782,7 +1964,7 @@ def procesar_imagen(
         r["accion"] = ACCION_SOLO_MINIATURA
         try:
             ancho, alto = generar_miniatura(ruta_full, part_thumb, thumb_max)
-            os.replace(part_thumb, ruta_thumb)
+            _renombrar(part_thumb, ruta_thumb)
             r.update(estado=EST_IMG_OK, miniatura_ancho=ancho, miniatura_alto=alto)
         except ImagenInvalida as exc:
             r.update(estado=EST_IMG_CORRUPTA, error=str(exc))
@@ -1827,8 +2009,8 @@ def procesar_imagen(
             except ImagenInvalida as exc:
                 r.update(estado=EST_IMG_CORRUPTA, error=str(exc))
             else:
-                os.replace(part_full, ruta_full)
-                os.replace(part_thumb, ruta_thumb)
+                _renombrar(part_full, ruta_full)
+                _renombrar(part_thumb, ruta_thumb)
                 r.update(miniatura_ancho=ancho, miniatura_alto=alto)
     finally:
         part_full.unlink(missing_ok=True)
@@ -2234,6 +2416,12 @@ def ejecutar_online(
         nombre_resumen=nombre_resumen,
     )
 
+    # Derivado solo de los JSON ya guardados: no hay peticiones ni descargas.
+    resumen["frecuencias"] = generar_frecuencias(
+        markers_dir, seleccion, output_dir / NOMBRE_FRECUENCIAS
+    )
+    escribir_json_atomico(output_dir / (nombre_resumen or "resum_online.json"), resumen)
+
     return resumen, consulta
 
 
@@ -2260,6 +2448,7 @@ CLAVES_REANUDACION = (
 ARCHIVOS_VERSION = (
     "IMATGES_INFOANTENAS.csv",
     "CONTROL_GIS_ID.csv",
+    NOMBRE_FRECUENCIAS,
     "log_markers.csv",
     "log_imatges.csv",
     "run.json",
@@ -2277,18 +2466,6 @@ def rutas_versiones(raiz: Path):
 
 def version_completa(directorio: Path):
     return directorio.is_dir() and (directorio / MARCADOR_COMPLETA).is_file()
-
-
-def _renombrar(origen: Path, destino: Path, intentos=3, espera=1.0):
-    """os.replace con reintentos ante bloqueos transitorios de Windows."""
-    for intento in range(1, intentos + 1):
-        try:
-            os.replace(origen, destino)
-            return
-        except PermissionError:
-            if intento == intentos:
-                raise
-            time.sleep(espera)
 
 
 def _validar_tipos(raiz: Path):
@@ -2456,6 +2633,14 @@ def verificar_version_en_disco(version_dir: Path, resumen):
         motivos.append("CONTROL_GIS_ID_INVALIDO")
     elif len(control) != resumen["inventario"]["gis_id_unicos"]:
         motivos.append("CONTROL_GIS_ID_INCONSISTENTE")
+
+    frecuencias = _leer_filas_csv(version_dir / NOMBRE_FRECUENCIAS, CAMPOS_FRECUENCIAS)
+    bloque_frecuencias = resumen.get("frecuencias")
+
+    if frecuencias is None:
+        motivos.append("FRECUENCIAS_INVALIDO")
+    elif not isinstance(bloque_frecuencias, dict) or len(frecuencias) != bloque_frecuencias.get("filas"):
+        motivos.append("FRECUENCIAS_INCONSISTENTE")
 
     if imagenes is None:
         motivos.append("IMATGES_INFOANTENAS_INVALIDO")
