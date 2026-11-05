@@ -33,7 +33,8 @@ Les respostes es guarden com a JSON, un per `GIS_ID`, i d'aquests mateixos JSON
 se'n deriven:
 
 - `IMATGES_INFOANTENAS.csv`: relació `GIS_ID` ↔ imatge, amb la imatge completa
-  descarregada i la miniatura generada.
+  descarregada i la miniatura generada, i amb el `CODI_OPERADOR` d'Antenas Móviles
+  de cada fila.
 - `FREQUENCIES_ANTENASMOVILES.csv`: dades base de les freqüències de cada marker.
 - `CONTROL_GIS_ID.csv`: control del creuament entre l'inventari i Antenas Móviles.
 
@@ -165,7 +166,7 @@ n'utilitza aquestes posicions (documentades a `parsear_marker`):
 | Posició | Contingut |
 |---|---|
 | `[0]` | `[codi]` |
-| `[1]` | `[empresa, codi_operador, <tercer valor sense ús>]` |
+| `[1]` | `[empresa, codi_operador, <tercer valor sense ús>]` (`codi_operador` és el `CODI_OPERADOR` de `IMATGES_INFOANTENAS.csv`) |
 | `[2]` | `[direcció, latitud, longitud, altura]` |
 | `[3]` | **Freqüències** (llista de `freq[]`, vegeu [§7](#7-generació-de-frequencies_antenasmovilescsv)) |
 | `[4]` | **Imatges**: diccionaris amb `id`, `fichero`, `autor`, `fecha_foto`, `fecha_subida`, `old`, `desmantelada`, `lat_subida`, `lon_subida`, `asociadas` |
@@ -303,7 +304,14 @@ El CSV té **una fila per relació** (`GIS_ID`, imatge): per a cada `GIS_ID`
 consultat, cada element de la resposta i cada imatge de `elemento[4]` amb
 `fichero`. Les imatges sense `fichero` es descarten i es reporten
 (`IMAGENES_SIN_FICHERO_DESCARTADAS`). `GIS_ID` és el de l'inventari consultat;
-`CODIGO_ANTENASMOVILES` és el codi de l'element de la resposta.
+`CODIGO_ANTENASMOVILES` és el codi de l'element de la resposta i `CODI_OPERADOR`
+el codi d'operador d'Antenas Móviles d'aquest mateix element (`elemento[1][1]`).
+
+Cada element processat del marker conté el seu propi `codi_operador` i les
+files d'imatge hereten aquest valor. Per això un mateix `GIS_ID` pot produir
+files amb `CODI_OPERADOR` diferents; la parella `GIS_ID` + `CODI_OPERADOR`
+permet resoldre l'antena corresponent. `NOMBRE_FICHERO_ORIGEN` només serveix per deduplicar la
+descàrrega física i no identifica l'antena.
 
 ### Columnes (`CAMPOS_IMAGENES` + `CAMPOS_DESCARGA`)
 
@@ -311,6 +319,7 @@ consultat, cada element de la resposta i cada imatge de `elemento[4]` amb
 |---|---|
 | `GIS_ID` | `GIS_ID` de l'inventari consultat |
 | `CODIGO_ANTENASMOVILES` | `elemento[0][0]` de la resposta |
+| `CODI_OPERADOR` | `elemento[1][1]` de la resposta (text; buit només si el marker no el porta) |
 | `ID_IMAGEN_ORIGEN` | imatge `id` |
 | `NOMBRE_FICHERO_ORIGEN` | imatge `fichero` |
 | `AUTOR` | imatge `autor` |
@@ -330,6 +339,35 @@ consultat, cada element de la resposta i cada imatge de `elemento[4]` amb
 El CSV es codifica amb `utf-8-sig` i separador `;`. L'operador de l'inventari es
 dedueix de `properties_Gis_Codigo` i es compara per igualtat exacta amb l'empresa
 del marker; no es defineix cap llindar de distància.
+
+`CODI_OPERADOR` s'obté durant l'extracció (a `cruzar`, a partir del resultat de
+`parsear_marker`); no cal cap altra consulta a `/v1/markers`. Com que
+`verificar_version_en_disco` exigeix la capçalera exacta, una versió generada
+abans d'aquest canvi (sense la columna) es marca com `IMATGES_INFOANTENAS_INVALIDO`
+fins que es regenera.
+
+### Ús des de FME
+
+FME rep ja `GIS_ID` + `CODI_OPERADOR` a `IMATGES_INFOANTENAS.csv`. **No necessita
+llegir ni interpretar els JSON de `markers/`** per carregar les imatges: aquests
+JSON són només part del procés intern d'extracció.
+
+Per resoldre l'antena concreta, FME ha de mapar `CODI_OPERADOR` a l'`OPERADOR_ID`
+intern i després resoldre:
+
+```
+GIS_ID + OPERADOR_ID -> TELCO_ANTENES_MOBILS.ID -> ANTENA_ID
+```
+
+Mapatge de referència (queda a FME, no al codi d'aquest repositori):
+
+| `CODI_OPERADOR` | Operador | `OPERADOR_ID` |
+|---|---|---|
+| `1` | Vodafone | 1 |
+| `3` | Orange | 2 |
+| `7` | Telefónica | 3 |
+| `4` | Xfera | 4 |
+| `22` | Digi | 5 |
 
 ### Quan es descarreguen les imatges full
 
@@ -617,11 +655,14 @@ Notes:
 - Segons aquell mateix `resum.json`: 9338 `GIS_ID` únics a l'inventari i
   processats, 9337 amb elements i 1 amb resposta buida; 6779 relacions
   `GIS_ID`–imatge i 2888 imatges úniques descarregades, sense errors.
+- Validació addicional amb dades reals de `CODI_OPERADOR`: s'ha generat un
+  `IMATGES_INFOANTENAS.csv` temporal només a partir dels JSON existents de
+  `markers/` (sense xarxa), amb 6779 relacions d'imatge, `CODI_OPERADOR` només
+  amb els valors `1`, `3`, `4`, `7` i `22`, i 0 files amb `CODI_OPERADOR` buit.
 
 Tests ([test_extraer_imagenes_infoantenas.py](test_extraer_imagenes_infoantenas.py)):
 
-- **226 tests.**
-- **3 execucions completes seguides, totes OK.**
+- Suite actual: **229 tests, OK.**
 - Els tests no fan peticions de xarxa reals (HTTP simulat) i inclouen la
   cobertura de les freqüències, de les escriptures atòmiques amb reintents i del
   versionat.
@@ -638,11 +679,11 @@ extraer_imagenes_infoantenas.py --versiones-dir <RAIZ>
 GET /v1/markers?id=<GIS_ID>      (una petició per GIS_ID)
         |
         v
-<RAIZ>/nueva/markers/            (un JSON per GIS_ID: marker + frequencies + imatges)
-        |
+<RAIZ>/nueva/markers/            (un JSON per GIS_ID: marker + frequencies + imatges;
+        |                         intern a l'extracció, no és entrada de FME)
         +--> CONTROL_GIS_ID.csv
         |
-        +--> IMATGES_INFOANTENAS.csv
+        +--> IMATGES_INFOANTENAS.csv   (inclou CODI_OPERADOR: FME rep GIS_ID + CODI_OPERADOR)
         |       +--> full/    (descàrrega, una vegada per fitxer físic)
         |       +--> thumb/   (generades localment)
         |
