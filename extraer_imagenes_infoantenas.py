@@ -253,6 +253,7 @@ CAMPOS_CONTROL = [
 CAMPOS_IMAGENES = [
     "GIS_ID",
     "CODIGO_ANTENASMOVILES",
+    "CODI_OPERADOR",
     "ID_IMAGEN_ORIGEN",
     "NOMBRE_FICHERO_ORIGEN",
     "AUTOR",
@@ -752,6 +753,7 @@ def cruzar(inventario, markers, estados_consulta=None):
                     filas_imagenes.append({
                         "GIS_ID": gis_id,
                         "CODIGO_ANTENASMOVILES": elemento["codigo"],
+                        "CODI_OPERADOR": elemento["codigo_operador"],
                         "ID_IMAGEN_ORIGEN": imagen["id"],
                         "NOMBRE_FICHERO_ORIGEN": imagen["fichero"],
                         "AUTOR": imagen["autor"],

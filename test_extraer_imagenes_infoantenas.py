@@ -56,10 +56,10 @@ def escribir_inventario(path, filas):
             ])
 
 
-def marker(codigo, operador, lat, lon, imagenes):
+def marker(codigo, operador, lat, lon, imagenes, codigo_operador="1"):
     return [[
         [codigo],
-        [operador, "1", "1"],
+        [operador, codigo_operador, "1"],
         ["DIRECCION", lat, lon, "10m"],
         [],
         imagenes,
@@ -268,6 +268,31 @@ class TestCruce(unittest.TestCase):
         self.assertEqual(resumen["imagenes"]["unicas_por_fichero"], 1)
         self.assertEqual(resumen["cruce"]["gis_id_encontrados"], 3)
 
+    def test_codi_operador_por_fila_de_imagen(self):
+        _, _, _, _, imagenes = self.cruzar(
+            [
+                ("0000758", "VODAFONE ESPAÑA, S.A.U.", 41.0, 2.0),
+                ("000758", "ORANGE ESPAGNE, S.A.U.", 41.0, 2.0),
+                ("4300034", "TELEFONICA MOVILES ESPAÑA, S.A.U.", 41.0, 2.0),
+            ],
+            [
+                ("0000758", marker("0000758", "VODAFONE", 41.0, 2.0,
+                                   [imagen("1", "a.jpg")], "1")),
+                ("000758", marker("000758", "ORANGE", 41.0, 2.0,
+                                  [imagen("1", "a.jpg")], "3")),
+                # Un marker con dos elementos de operadores distintos.
+                ("4300034", marker("4300034", "TELEFONICA", 41.0, 2.0,
+                                   [imagen("2", "b.jpg")], "7")
+                 + marker("4300034", "DIGI", 41.0, 2.0, [imagen("3", "c.jpg")], "22")),
+            ],
+        )
+
+        self.assertEqual(
+            [(f["GIS_ID"], f["NOMBRE_FICHERO_ORIGEN"], f["CODI_OPERADOR"]) for f in imagenes],
+            [("0000758", "a.jpg", "1"), ("000758", "a.jpg", "3"),
+             ("4300034", "b.jpg", "7"), ("4300034", "c.jpg", "22")],
+        )
+
     def test_raw_con_codigo_fuera_del_inventario(self):
         inventario, markers, est_raw, control, _ = self.cruzar(
             [("1", "OP", 41.0, 2.0)],
@@ -310,11 +335,64 @@ class TestSalida(unittest.TestCase):
                 imagenes = list(csv.DictReader(f, delimiter=";"))
             self.assertEqual(len(imagenes), 1)
             self.assertEqual(imagenes[0]["GIS_ID"], "0000758")
+            self.assertEqual(imagenes[0]["CODI_OPERADOR"], "1")
+            with (tmp / "out" / "IMATGES_INFOANTENAS.csv").open(encoding="utf-8-sig", newline="") as f:
+                self.assertEqual(next(csv.reader(f, delimiter=";")), m.CAMPOS_IMAGENES)
+            self.assertIn("CODI_OPERADOR", m.CAMPOS_IMAGENES)
             self.assertEqual(
                 imagenes[0]["URL_ORIGEN"],
                 "https://antenasmoviles.es/archive/antenas/1729885461_6fbc2e6031932d57e56c.jpg",
             )
             self.assertEqual(imagenes[0]["OPERADOR_COINCIDE"], "SI")
+
+    def test_mismo_gis_id_literal_con_dos_operadores_se_resuelve_por_gis_id_y_codi_operador(self):
+        vodafone = "VODAFONE ESPAÑA, S.A.U."
+        telefonica = "TELEFONICA MOVILES ESPAÑA, S.A.U."
+        compartida = imagen("10", "compartida.jpg")
+        respuesta = (
+            marker("4300034", vodafone, 40.5, 0.4,
+                   [compartida, imagen("11", "solo_vodafone.jpg")], "1")
+            + marker("4300034", telefonica, 40.5, 0.4,
+                     [compartida, imagen("12", "solo_telefonica.jpg")], "7")
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            escribir_inventario(tmp / "inv.csv", [
+                ("4300034", vodafone, 40.5, 0.4),
+                ("4300034", telefonica, 40.5, 0.4),
+            ])
+            (tmp / "raw.jsonl").write_text(
+                json.dumps({"codigo_antena": "4300034", "http_status": 200,
+                            "data": respuesta}, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+
+            resumen = m.ejecutar(tmp / "inv.csv", tmp / "raw.jsonl", tmp / "out")
+
+            with (tmp / "out" / "IMATGES_INFOANTENAS.csv").open(encoding="utf-8-sig", newline="") as f:
+                filas = list(csv.DictReader(f, delimiter=";"))
+
+        self.assertEqual(resumen["inventario"]["gis_id_unicos"], 1)
+        self.assertEqual({f["GIS_ID"] for f in filas}, {"4300034"})
+
+        # La clave funcional es (GIS_ID, CODI_OPERADOR); el fichero solo es físico.
+        claves = [(f["GIS_ID"], f["CODI_OPERADOR"], f["ID_IMAGEN_ORIGEN"]) for f in filas]
+        self.assertEqual(sorted(claves), [
+            ("4300034", "1", "10"), ("4300034", "1", "11"),
+            ("4300034", "7", "10"), ("4300034", "7", "12"),
+        ])
+
+        por_operador = {
+            codi: {f["ID_IMAGEN_ORIGEN"] for f in filas if f["CODI_OPERADOR"] == codi}
+            for codi in ("1", "7")
+        }
+        self.assertEqual(por_operador, {"1": {"10", "11"}, "7": {"10", "12"}})
+
+        # La imagen compartida genera una relación por operador, sin colapsarse.
+        compartidas = [f for f in filas if f["NOMBRE_FICHERO_ORIGEN"] == "compartida.jpg"]
+        self.assertEqual({f["CODI_OPERADOR"] for f in compartidas}, {"1", "7"})
+        self.assertTrue(all(f["OPERADOR_COINCIDE"] == "SI" for f in filas))
 
 
 # ---------------------------------------------------------------------------
@@ -1394,6 +1472,14 @@ class TestOnlineConImagenes(unittest.TestCase):
         self.assertEqual({f["ESTADO_DESCARGA"] for f in filas}, {m.EST_IMG_OK})
         self.assertEqual(resumen["descarga"]["descargas_evitadas_por_deduplicacion"], 1)
         self.assertEqual(resumen["imagenes"]["unicas_por_fichero"], 2)
+
+    def test_csv_con_descarga_incluye_codi_operador(self):
+        self.online(self.marcadores(), self.imagenes_ok())
+        with (self.out / "IMATGES_INFOANTENAS.csv").open(encoding="utf-8-sig", newline="") as f:
+            self.assertEqual(
+                next(csv.reader(f, delimiter=";")), m.CAMPOS_IMAGENES + m.CAMPOS_DESCARGA
+            )
+        self.assertEqual({f["CODI_OPERADOR"] for f in self.leer_csv()}, {"1"})
 
     def test_rutas_relativas_y_ficheros_existentes(self):
         self.online(self.marcadores(), self.imagenes_ok())
